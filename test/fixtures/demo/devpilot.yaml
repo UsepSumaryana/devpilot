@@ -6,11 +6,21 @@ env_profiles:
 profiles:
   default: [api, web, worker]
   all: [api, web, worker, crasher]
+tasks:
+  install: node install.mjs
+
 services:
   api:
     run: node api.mjs
     port: 4510
     health: { http: /health, interval: 2s }
+    tasks:
+      install: node install.mjs
+      build: node build.mjs
+    modes:
+      build:
+        run: node dist/api.mjs
+        before: [install, build]
   web:
     run: python -m http.server 4511 --bind 127.0.0.1
     port: 4511

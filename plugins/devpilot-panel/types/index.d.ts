@@ -16,9 +16,23 @@ export type Row = {
   dependsOn: string[];
   group: string | null;
   queued: boolean;
+  mode: string;
+  modes: string[];
+  task: string | null; // running one-shot task, if any
+  tasks: string[]; // task names it defines
 };
 
-export type Ws = { id: string; name: string; envProfile: string | null; services: Row[] };
+export type Ws = {
+  id: string;
+  name: string;
+  envProfile: string | null;
+  services: Row[];
+  mode: string;
+  modes: string[];
+  tasks: string[]; // workspace-level
+  serviceTasks: string[]; // union of the services' task names
+  runningTasks: string[]; // "install", "build (api)"...
+};
 
 export type Snapshot = {
   daemon: 'up' | 'down' | 'unknown';
@@ -31,6 +45,18 @@ export type Snapshot = {
 
 export type Scope = 'project' | 'all';
 
+/** An action waiting for the person's confirmation (two-step buttons). */
+export type Confirm = {
+  title: string;
+  detail: string;
+  label: string; // the confirm button
+  danger: boolean;
+  method: string;
+  path: string;
+  body: Record<string, unknown> | null;
+  busy: string; // what the header says while it runs
+};
+
 declare module 'claude-code' {
   interface PluginState {
     'devpilot-panel': {
@@ -38,6 +64,7 @@ declare module 'claude-code' {
       scope: Shaped<Scope>;
       busy: Shaped<string | null>;
       menu: Shaped<boolean>;
+      confirm: Shaped<Confirm | null>;
     };
   }
 }

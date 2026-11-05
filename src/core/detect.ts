@@ -14,6 +14,8 @@ export interface DetectedService {
   port?: number;
   health?: { http?: string; tcp?: number };
   depends_on?: string[];
+  tasks?: Record<string, string>;
+  modes?: Record<string, { run: string; before?: string[] }>;
   runtime: string;
   confidence: 'high' | 'medium' | 'low';
   note?: string;
@@ -62,11 +64,22 @@ function nodeService(dir: string, name: string): DetectedService | null {
     name: (pkg.name || name).replace(/^@[^/]+\//, '').replace(/[^A-Za-z0-9._-]/g, '-'),
     cwd: '',
     run: pm === 'npm' ? `npm run ${script}` : `${pm} ${script}`,
+    ...nodeExtras(pm, scripts, script),
     port: port || undefined,
     runtime,
     confidence: port ? 'high' : 'medium',
     note: port ? undefined : 'port unknown — set `port:` so readiness and health checks work',
   };
+}
+
+/** install/build tasks, and a "build" mode running the built output when the scripts allow it. */
+function nodeExtras(pm: string, scripts: Record<string, string>, devScript: string): Pick<DetectedService, 'tasks' | 'modes'> {
+  const runScript = (s: string) => (pm === 'npm' ? `npm run ${s}` : `${pm} ${s}`);
+  const tasks: Record<string, string> = { install: `${pm} install` };
+  if (scripts.build) tasks.build = runScript('build');
+  const prodScript = ['start:prod', 'serve:prod', 'preview', 'start'].find((s) => scripts[s] && s !== devScript);
+  const modes = scripts.build && prodScript ? { build: { run: runScript(prodScript), before: ['build'] } } : undefined;
+  return { tasks, ...(modes ? { modes } : {}) };
 }
 
 function pythonService(dir: string, name: string): DetectedService | null {
@@ -75,17 +88,18 @@ function pythonService(dir: string, name: string): DetectedService | null {
   const venv = ['.venv', 'venv'].find((v) => exists(dir, v));
   const py = venv ? (process.platform === 'win32' ? `${venv}\\Scripts\\python` : `${venv}/bin/python`) : 'python';
   const reqs = (read(path.join(dir, 'requirements.txt')) + read(path.join(dir, 'pyproject.toml'))).toLowerCase();
-  if (exists(dir, 'manage.py')) return { name, cwd: '', run: `${py} manage.py runserver 8000`, port: 8000, runtime: 'django', confidence: 'high' };
+  const pyTasks = exists(dir, 'requirements.txt') ? { tasks: { install: `${py} -m pip install -r requirements.txt` } } : {};
+  if (exists(dir, 'manage.py')) return { name, cwd: '', run: `${py} manage.py runserver 8000`, port: 8000, runtime: 'django', confidence: 'high', ...pyTasks, tasks: { ...(pyTasks.tasks || {}), migrate: `${py} manage.py migrate` } };
   for (const f of ['main.py', 'app.py', 'app/main.py', 'src/main.py', 'server.py']) {
     const src = read(path.join(dir, f));
     if (!src) continue;
     const mod = f.replace(/\.py$/, '').replace(/\//g, '.');
     if (/FastAPI\(/.test(src) || reqs.includes('fastapi')) {
       const app = src.match(/^(\w+)\s*=\s*FastAPI\(/m)?.[1] || 'app';
-      return { name, cwd: '', run: `${py} -m uvicorn ${mod}:${app} --reload --port 8000`, port: 8000, health: { http: '/docs' }, runtime: 'fastapi', confidence: 'high' };
+      return { name, cwd: '', run: `${py} -m uvicorn ${mod}:${app} --reload --port 8000`, port: 8000, health: { http: '/docs' }, runtime: 'fastapi', confidence: 'high', ...pyTasks };
     }
     if (/Flask\(/.test(src) || reqs.includes('flask')) {
-      return { name, cwd: '', run: `${py} -m flask --app ${mod} run --port 5000`, port: 5000, runtime: 'flask', confidence: 'high' };
+      return { name, cwd: '', run: `${py} -m flask --app ${mod} run --port 5000`, port: 5000, runtime: 'flask', confidence: 'high', ...pyTasks };
     }
     return { name, cwd: '', run: `${py} ${f}`, runtime: 'python', confidence: 'low', note: 'guessed entry point' };
   }
@@ -222,6 +236,8 @@ export function draftYaml(root: string, services: DetectedService[]): string {
     if (s.port) o.port = s.port;
     if (s.health) o.health = s.health;
     if (s.depends_on) o.depends_on = s.depends_on;
+    if (s.tasks && Object.keys(s.tasks).length) o.tasks = s.tasks;
+    if (s.modes) o.modes = s.modes;
     doc.services[s.name] = o;
   }
   const apps = services.filter((s) => s.runtime !== 'docker-compose').map((s) => s.name);

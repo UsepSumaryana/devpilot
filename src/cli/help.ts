@@ -1,8 +1,10 @@
 export const COMMANDS = [
   { cmd: 'init [dir] [--write] [--force]', desc: 'Detect services (Node, Python, Go, Java, Rust, .NET, Docker Compose, Procfile) and draft devpilot.yaml; --write saves and registers it' },
-  { cmd: 'up [profile|service...] [--wait]', desc: 'Start a profile (default: "default") or services, dependencies first' },
+  { cmd: 'up [profile|service...] [--wait] [--mode <mode>]', desc: 'Start a profile (default: "default") or services, dependencies first' },
   { cmd: 'down [service...]', desc: 'Stop the workspace (dependents first) or the given services' },
-  { cmd: 'start|stop|restart <service> [--wait] [--timeout 60s] [--no-deps]', desc: 'Control one service; --wait blocks until ready and returns logs on failure' },
+  { cmd: 'start|stop|restart <service> [--wait] [--timeout 60s] [--no-deps] [--mode <mode>]', desc: 'Control one service; --wait blocks until ready and returns logs on failure' },
+  { cmd: 'mode | mode use <mode> [service...] [--restart] | mode reset [service...]', desc: 'Show or switch how services run (e.g. watch vs built output); "default" is the plain config' },
+  { cmd: 'task [list] | task run <task> [service] [--all] [--detach] | task cancel <id>', desc: 'Run one-shot tasks (yarn install, build, migrations) and follow their output' },
   { cmd: 'status [service] [--all]', desc: 'Status, health, CPU/mem, restarts of the current workspace (or one service)' },
   { cmd: 'logs <service> [-n 100] [--grep re] [--since 5m] [--stream err|out|sys] [-f]', desc: 'Query or follow logs' },
   { cmd: 'incidents [service] [--open] [--since 1h] [--all] | incidents clear [service] [--all]', desc: 'Crashes, failed starts, health failures, memory alarms, error bursts; clear marks them resolved' },
@@ -63,6 +65,19 @@ services:
     alerts: { mem_mb: 1500, unhealthy_after: 3, error_patterns: ["DEADLOCK"] }
     autostart: false               # start when the daemon boots
     group: Core services           # optional heading in the panel (default: derived from depends_on)
+    tasks:                         # one-shot commands: devpilot task run install api
+      install: yarn install
+      build: { run: yarn build, timeout: 10m }
+      clean-install: { run: yarn install --force, stop_service: true }   # stops the service while it runs
+    modes:                         # alternative ways to run it: devpilot mode use build --restart
+      build:
+        run: node dist/main.js     # anything not given falls back to the plain config ("default" mode)
+        before: [install, build]   # tasks run first on a deliberate start (not on crash restarts)
+        env: { NODE_ENV: production }
+        ready: { log: "listening", timeout: 5m }
+
+tasks:                             # workspace-level tasks, run in the folder of devpilot.yaml
+  install: yarn install
 
 Readiness: ready.log if set, else the health check, else "alive for 1.5s".
 Without health config a service with a port gets a TCP check on that port (IPv4 and IPv6).`;

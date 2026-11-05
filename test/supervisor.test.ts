@@ -14,13 +14,13 @@ let id: string;
 
 beforeAll(async () => {
   fs.writeFileSync(path.join(WS, 'ok.mjs'), "console.log('starting'); setTimeout(() => console.log('READY now'), 300); setInterval(() => {}, 1000);");
-  fs.writeFileSync(path.join(WS, 'boom.mjs'), "console.log('hi'); setTimeout(() => { throw new TypeError('kaboom') }, 200);");
+  fs.writeFileSync(path.join(WS, 'boom.mjs'), "console.log('hi'); throw new TypeError('kaboom');");
   fs.writeFileSync(
     path.join(WS, 'devpilot.yaml'),
     `services:
   base: { run: node ok.mjs, ready: { log: "READY" } }
   app: { run: node ok.mjs, ready: { log: "READY" }, depends_on: [base] }
-  boom: { run: node boom.mjs, restart: { max: 1, delay: 100ms } }
+  boom: { run: node boom.mjs, ready: { log: "never-printed" }, restart: { max: 1, delay: 100ms } }
 `,
   );
   sup = new Supervisor();

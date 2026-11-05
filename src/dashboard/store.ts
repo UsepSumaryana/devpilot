@@ -54,11 +54,14 @@ class Store {
     // Coalesce bursts of events into one render per frame.
     if (this.pending) return;
     this.pending = true;
-    requestAnimationFrame(() => {
+    const flush = () => {
       this.pending = false;
       this.state = { ...this.state };
       this.listeners.forEach((f) => f());
-    });
+    };
+    // rAF never fires in a hidden tab; fall back to a timer there.
+    if (document.visibilityState === 'visible') requestAnimationFrame(flush);
+    else setTimeout(flush, 250);
   }
 
   async refresh() {
@@ -100,6 +103,7 @@ class Store {
     es.addEventListener('metrics', (e) => this.apply(JSON.parse((e as MessageEvent).data)));
     es.addEventListener('log', (e) => this.apply(JSON.parse((e as MessageEvent).data)));
     es.addEventListener('workspaces', () => void this.refresh());
+    es.addEventListener('task', () => void this.refresh());
     es.onerror = () => {
       this.state.connected = false;
       this.notify();

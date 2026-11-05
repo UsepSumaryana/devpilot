@@ -5,8 +5,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
-import type { DaemonEvent, HealthInfo, ServiceStatus, ServiceView, WorkspaceView } from '../shared/types.js';
-import { findConfig, loadConfig, resolveEnv, type ServiceSpec, type WorkspaceConfig } from './config.js';
+import crypto from 'node:crypto';
+import type { DaemonEvent, HealthInfo, ServiceStatus, ServiceView, TaskRun, WorkspaceView } from '../shared/types.js';
+import { applyMode, DEFAULT_MODE, findConfig, loadConfig, readEnvFile, resolveEnv, type ServiceSpec, type TaskSpec, type WorkspaceConfig } from './config.js';
 import { LogStore } from './logs.js';
 import { OutputTail, type TailPos } from './capture.js';
 import { ErrorDetector, IncidentStore, pickHeadline } from './incidents.js';
@@ -27,6 +28,8 @@ export interface StartResult {
 interface Runtime {
   key: string;
   ws: string;
+  /** The plain config; `spec` is it with the active mode applied. */
+  base: ServiceSpec;
   spec: ServiceSpec;
   status: ServiceStatus;
   child?: ChildProcess;
@@ -44,6 +47,8 @@ interface Runtime {
   restartTimer?: NodeJS.Timeout;
   readyTimer?: NodeJS.Timeout;
   generation: number;
+  /** Bumped by every start and stop: a start whose before-tasks outlive a newer start/stop must not spawn. */
+  startSeq: number;
   health: HealthInfo;
   lastLatency?: number;
   history: MetricsHistory;
@@ -59,13 +64,16 @@ interface WorkspaceEntry {
   root: string;
   configPath: string;
   envProfile?: string;
+  /** Workspace-wide mode, and per-service overrides of it. */
+  mode?: string;
+  serviceModes: Record<string, string>;
   config?: WorkspaceConfig;
   error?: string;
   watcher?: fs.FSWatcher;
 }
 
 interface RegistryFile {
-  workspaces: Array<{ configPath: string; envProfile?: string }>;
+  workspaces: Array<{ configPath: string; envProfile?: string; mode?: string; serviceModes?: Record<string, string> }>;
 }
 
 interface StateFile {
@@ -86,6 +94,8 @@ export class Supervisor {
   private detector: ErrorDetector;
   /** Waiting in launchGraph for dependencies to become ready. */
   private queued = new Set<string>();
+  private taskRuns: TaskRun[] = [];
+  private taskProcs = new Map<string, ChildProcess>();
   private cancelled = new Set<string>();
   private stateDirty = false;
 
@@ -147,7 +157,7 @@ export class Supervisor {
     const reg = readJson<RegistryFile>(paths.registry, { workspaces: [] });
     for (const w of reg.workspaces) {
       if (!fs.existsSync(w.configPath)) continue;
-      this.addWorkspace(w.configPath, { envProfile: w.envProfile, persist: false });
+      this.addWorkspace(w.configPath, { envProfile: w.envProfile, mode: w.mode, serviceModes: w.serviceModes, persist: false });
     }
     await this.adoptOrphans();
     for (const rt of this.runtimes.values()) if (rt.spec.autostart && rt.status === 'stopped') void this.start(rt.key);
@@ -160,11 +170,11 @@ export class Supervisor {
   }
 
   /** Register (or re-register) a workspace from a folder or a config path. */
-  addWorkspace(pathOrDir: string, opts: { envProfile?: string; persist?: boolean } = {}): WorkspaceEntry & { id: string } {
+  addWorkspace(pathOrDir: string, opts: { envProfile?: string; mode?: string; serviceModes?: Record<string, string>; persist?: boolean } = {}): WorkspaceEntry & { id: string } {
     const stat = fs.existsSync(pathOrDir) ? fs.statSync(pathOrDir) : null;
     const configPath = stat?.isDirectory() ? findConfig(pathOrDir) : stat ? path.resolve(pathOrDir) : null;
     if (!configPath) throw new Error(`No devpilot.yaml found in ${pathOrDir} or its parents. Run \`devpilot init\` there first.`);
-    const entry: WorkspaceEntry = { root: path.dirname(configPath), configPath, envProfile: opts.envProfile };
+    const entry: WorkspaceEntry = { root: path.dirname(configPath), configPath, envProfile: opts.envProfile, mode: opts.mode, serviceModes: { ...(opts.serviceModes || {}) } };
     const existing = [...this.workspaces.entries()].find(([, w]) => w.configPath.toLowerCase() === configPath.toLowerCase());
     if (existing) {
       if (opts.envProfile !== undefined) existing[1].envProfile = opts.envProfile;
@@ -195,8 +205,12 @@ export class Supervisor {
       const key = `${wsId}/${spec.name}`;
       keep.add(key);
       const rt = this.runtimes.get(key);
-      if (rt) rt.spec = spec; // takes effect on next (re)start
-      else this.runtimes.set(key, this.newRuntime(key, wsId, spec));
+      const effective = applyMode(spec, this.modeFor(entry, spec));
+      if (rt) {
+        // takes effect on next (re)start
+        rt.base = spec;
+        rt.spec = effective;
+      } else this.runtimes.set(key, this.newRuntime(key, wsId, spec, effective));
     }
     for (const [key, rt] of this.runtimes) {
       if (rt.ws === wsId && !keep.has(key)) {
@@ -206,16 +220,18 @@ export class Supervisor {
     return wsId;
   }
 
-  private newRuntime(key: string, ws: string, spec: ServiceSpec): Runtime {
+  private newRuntime(key: string, ws: string, base: ServiceSpec, spec: ServiceSpec): Runtime {
     return {
       key,
       ws,
+      base,
       spec,
       status: 'stopped',
       restarts: 0,
       restartTimes: [],
       stopping: false,
       generation: 0,
+      startSeq: 0,
       health: { state: 'unknown', kind: spec.health?.kind || 'none', consecutiveFailures: 0 },
       history: new MetricsHistory(),
       adopted: false,
@@ -264,6 +280,50 @@ export class Supervisor {
     this.saveRegistry();
   }
 
+  /** The mode a service should run in: its own override, else the workspace's, if it defines it. */
+  private modeFor(entry: WorkspaceEntry, base: ServiceSpec): string {
+    const want = entry.serviceModes[base.name] ?? entry.mode;
+    return want && base.modes[want] ? want : DEFAULT_MODE;
+  }
+
+  /**
+   * Switch the mode of a whole workspace (clearing per-service overrides) or of
+   * some services. Returns the services whose effective mode changed and are
+   * live, so the caller can restart them.
+   */
+  setMode(wsId: string, mode: string, services?: string[]): { changed: string[]; live: string[] } {
+    const entry = this.workspaces.get(wsId);
+    if (!entry?.config) throw new Error(entry?.error || `Unknown workspace ${wsId}`);
+    if (!entry.config.modes.includes(mode)) throw new Error(`Unknown mode "${mode}". Defined: ${entry.config.modes.join(', ')}`);
+    if (services?.length) {
+      for (const name of services) {
+        const rt = this.runtimes.get(`${wsId}/${name}`);
+        if (!rt) throw new Error(`Unknown service ${name}`);
+        if (mode !== DEFAULT_MODE && !rt.base.modes[mode]) throw new Error(`Service ${name} has no mode "${mode}" (it has: ${[DEFAULT_MODE, ...Object.keys(rt.base.modes)].join(', ')})`);
+        if (mode === (entry.mode ?? DEFAULT_MODE)) delete entry.serviceModes[name];
+        else entry.serviceModes[name] = mode;
+      }
+    } else {
+      entry.mode = mode === DEFAULT_MODE ? undefined : mode;
+      entry.serviceModes = {};
+    }
+    const changed: string[] = [];
+    const live: string[] = [];
+    for (const rt of this.runtimes.values()) {
+      if (rt.ws !== wsId) continue;
+      const next = this.modeFor(entry, rt.base);
+      if (next === rt.spec.mode) continue;
+      const wasLive = ['starting', 'running', 'unhealthy', 'backoff'].includes(rt.status);
+      rt.spec = applyMode(rt.base, next);
+      changed.push(rt.key);
+      if (wasLive) live.push(rt.key);
+      this.logs.system(rt.key, `⇢ mode: ${next}${wasLive ? ' (restart to apply)' : ''}`);
+      this.emitStatus(rt);
+    }
+    this.saveRegistry();
+    return { changed, live };
+  }
+
   /** Workspace id for a folder: the registered workspace whose root contains it. */
   workspaceFor(dir: string): string | undefined {
     const d = path.resolve(dir).toLowerCase() + path.sep;
@@ -277,7 +337,12 @@ export class Supervisor {
 
   private saveRegistry() {
     writeJsonAtomic(paths.registry, {
-      workspaces: [...this.workspaces.values()].map((w) => ({ configPath: w.configPath, envProfile: w.envProfile })),
+      workspaces: [...this.workspaces.values()].map((w) => ({
+        configPath: w.configPath,
+        envProfile: w.envProfile,
+        mode: w.mode,
+        serviceModes: Object.keys(w.serviceModes).length ? w.serviceModes : undefined,
+      })),
     } satisfies RegistryFile);
   }
 
@@ -328,6 +393,10 @@ export class Supervisor {
       lastError: rt.lastError,
       openIncidents: this.incidents.openCount(rt.key),
       queued: this.queued.has(rt.key),
+      mode: rt.spec.mode,
+      modes: [DEFAULT_MODE, ...Object.keys(rt.base.modes)],
+      tasks: Object.keys(rt.base.tasks),
+      task: this.taskRuns.find((t) => t.status === 'running' && t.logKey === rt.key)?.task,
     };
   }
 
@@ -344,6 +413,11 @@ export class Supervisor {
         envProfiles: w.config?.envProfiles || [],
         configError: w.error,
         services: [...this.runtimes.values()].filter((r) => r.ws === id).map((r) => this.view(r)),
+        mode: w.mode ?? DEFAULT_MODE,
+        modes: w.config?.modes || [DEFAULT_MODE],
+        tasks: Object.keys(w.config?.tasks || {}),
+        serviceTasks: [...new Set((w.config?.services || []).flatMap((s) => Object.keys(s.tasks)))],
+        runningTasks: this.taskRuns.filter((t) => t.workspace === id && t.status === 'running'),
       }));
   }
 
@@ -463,13 +537,34 @@ export class Supervisor {
     return { ok: ok && !['crashed', 'stopped', 'exited'].includes(rt.status), key, status: rt.status, reason: ok ? undefined : reason || rt.lastError, logs: ok ? undefined : this.logs.recent(key, 25) };
   }
 
-  private async spawnOne(key: string): Promise<StartResult> {
+  private async spawnOne(key: string, { runBefore = true }: { runBefore?: boolean } = {}): Promise<StartResult> {
     const rt = this.rt(key);
     if (['starting', 'running', 'unhealthy'].includes(rt.status)) return this.result(key, true);
     const entry = this.workspaces.get(rt.ws);
     if (entry?.error) return { ok: false, key, status: rt.status, reason: `config error: ${entry.error}` };
     clearTimeout(rt.restartTimer);
     rt.stopping = false;
+
+    // The mode's "before" tasks (install, build...), on a deliberate start only:
+    // a crash-restart must not rebuild.
+    const mine = ++rt.startSeq;
+    if (runBefore && rt.spec.before.length) {
+      rt.exitCode = undefined;
+      this.setStatus(rt, 'starting');
+      for (const name of rt.spec.before) {
+        const run = await this.runTask(rt.ws, rt.spec.name, name, { wait: true, reason: 'before-start' });
+        // A stop, mode switch or another start happened meanwhile: this start is stale.
+        if (rt.startSeq !== mine || rt.stopping || rt.status !== 'starting') return { ok: false, key, status: rt.status, reason: 'superseded while its tasks ran' };
+        if (run.status !== 'ok') {
+          rt.lastError = `task "${name}" ${run.status === 'cancelled' ? 'was cancelled' : `failed (exit code ${run.exitCode})`}`;
+          rt.exitCode = run.exitCode ?? null;
+          this.setStatus(rt, 'crashed');
+          return { ok: false, key, status: rt.status, reason: rt.lastError, logs: this.logs.recent(key, 25) };
+        }
+      }
+      // Back to "not started" so the spawn below proceeds as usual.
+      rt.status = 'stopped';
+    }
 
     if (rt.spec.port && !(await isPortFree(rt.spec.port))) {
       const holder = (await findListeningPids()).get(rt.spec.port);
@@ -618,7 +713,7 @@ export class Supervisor {
     this.logs.system(rt.key, `↻ restarting in ${(delay / 1000).toFixed(1)}s (attempt ${n + 1}/${policy.max})`);
     this.setStatus(rt, 'backoff');
     rt.restartTimer = setTimeout(() => {
-      if (rt.status === 'backoff') void this.spawnOne(rt.key);
+      if (rt.status === 'backoff') void this.spawnOne(rt.key, { runBefore: false });
     }, delay);
   }
 
@@ -646,6 +741,153 @@ export class Supervisor {
     ws.forEach((w) => w(ok));
   }
 
+  // ----------------------------------------------------------------- tasks
+
+  /** Task definitions of a workspace and its services, plus recent runs. */
+  taskInfo(wsId: string) {
+    const entry = this.workspaces.get(wsId);
+    if (!entry?.config) throw new Error(entry?.error || `Unknown workspace ${wsId}`);
+    const brief = (t: TaskSpec) => ({ name: t.name, run: t.run, cwd: t.cwd, description: t.description, stopService: t.stopService });
+    return {
+      workspace: Object.values(entry.config.tasks).map(brief),
+      services: Object.fromEntries(entry.config.services.filter((s) => Object.keys(s.tasks).length).map((s) => [s.name, Object.values(s.tasks).map(brief)])),
+      runs: this.taskRuns.filter((r) => r.workspace === wsId).slice(-30).reverse(),
+    };
+  }
+
+  taskRun(id: string) {
+    return this.taskRuns.find((r) => r.id === id);
+  }
+
+  /**
+   * Run a one-shot task: a service's own (or, with a service given, a
+   * workspace task in the workspace root), or a workspace task. Output goes
+   * to the service's log (or "<workspace>/tasks"). One run per task at a time.
+   */
+  async runTask(wsId: string, service: string | undefined, name: string, opts: { wait?: boolean; reason?: TaskRun['reason'] } = {}): Promise<TaskRun> {
+    const entry = this.workspaces.get(wsId);
+    if (!entry?.config) throw new Error(entry?.error || `Unknown workspace ${wsId}`);
+    const rt = service ? this.runtimes.get(`${wsId}/${service}`) : undefined;
+    if (service && !rt) throw new Error(`Unknown service ${service}`);
+    const spec = (rt && rt.base.tasks[name]) || entry.config.tasks[name];
+    if (!spec) {
+      const known = rt ? [...Object.keys(rt.base.tasks), ...Object.keys(entry.config.tasks)] : Object.keys(entry.config.tasks);
+      throw new Error(`Unknown task "${name}"${service ? ` for ${service}` : ''}. Defined: ${known.join(', ') || '(none)'}`);
+    }
+    const logKey = rt && rt.base.tasks[name] ? rt.key : rt ? rt.key : `${wsId}/tasks`;
+    const running = this.taskRuns.find((r) => r.status === 'running' && r.workspace === wsId && r.service === service && r.task === name);
+    if (running) return opts.wait ? this.waitTask(running) : running;
+
+    const env: Record<string, string> = {};
+    if (rt) Object.assign(env, resolveEnv(rt.spec, entry.envProfile));
+    else {
+      for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
+      for (const f of entry.config.envFiles) Object.assign(env, readEnvFile(f));
+      Object.assign(env, entry.config.env);
+    }
+    delete env.PORT; // a build or install must not grab the service port
+    if (!env.NO_COLOR) env.FORCE_COLOR ??= '1';
+
+    const run: TaskRun = {
+      id: crypto.randomBytes(5).toString('hex'),
+      workspace: wsId,
+      service,
+      task: name,
+      run: spec.run,
+      cwd: spec.cwd,
+      status: 'running',
+      startedAt: Date.now(),
+      logKey,
+      reason: opts.reason ?? 'manual',
+    };
+    this.taskRuns.push(run);
+    if (this.taskRuns.length > 200) this.taskRuns.splice(0, this.taskRuns.length - 200);
+
+    // Some tasks (yarn install on Windows) cannot run while the service holds its files.
+    let restartAfter = false;
+    if (rt && spec.stopService && ['starting', 'running', 'unhealthy', 'backoff'].includes(rt.status) && run.reason === 'manual') {
+      this.logs.system(logKey, `■ stopping ${rt.spec.name} while task "${name}" runs`);
+      await this.stop(rt.key);
+      restartAfter = true;
+    }
+
+    this.logs.system(logKey, `▷ task ${name}: ${spec.run}   (cwd ${spec.cwd})`);
+    this.emit({ type: 'task', run: { ...run } });
+    if (rt) this.emitStatus(rt);
+
+    const done = new Promise<TaskRun>((resolve) => {
+      let child: ChildProcess;
+      try {
+        child = spawnShell(spec.run, { cwd: spec.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (e: any) {
+        this.finishTask(run, 'failed', null, `could not start: ${e.message}`);
+        return resolve(run);
+      }
+      this.taskProcs.set(run.id, child);
+      child.stdout?.setEncoding('utf8');
+      child.stderr?.setEncoding('utf8');
+      child.stdout?.on('data', (d: string) => this.logs.write(logKey, 'out', d));
+      child.stderr?.on('data', (d: string) => this.logs.write(logKey, 'err', d));
+      const timer = setTimeout(() => {
+        if (child.pid) killTree(child.pid);
+        this.logs.system(logKey, `✖ task ${name} timed out after ${Math.round(spec.timeoutMs / 1000)}s`);
+      }, spec.timeoutMs);
+      child.on('error', (e) => this.logs.system(logKey, `✖ task ${name}: ${e.message}`));
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        this.taskProcs.delete(run.id);
+        this.logs.flush(logKey);
+        const status = run.status === 'cancelled' ? 'cancelled' : code === 0 ? 'ok' : 'failed';
+        this.finishTask(run, status, code);
+        if (restartAfter && rt) void this.start(rt.key, { deps: false });
+        resolve(run);
+      });
+    });
+    (run as any)._done = done;
+    return opts.wait ? done : run;
+  }
+
+  private waitTask(run: TaskRun): Promise<TaskRun> {
+    return ((run as any)._done as Promise<TaskRun>) ?? Promise.resolve(run);
+  }
+
+  private finishTask(run: TaskRun, status: TaskRun['status'], code: number | null, note?: string) {
+    run.status = status;
+    run.exitCode = code;
+    run.endedAt = Date.now();
+    const secs = ((run.endedAt - run.startedAt) / 1000).toFixed(1);
+    if (status === 'ok') this.logs.system(run.logKey, `✔ task ${run.task} done in ${secs}s`);
+    else if (status === 'cancelled') this.logs.system(run.logKey, `■ task ${run.task} cancelled`);
+    else {
+      this.logs.system(run.logKey, `✖ task ${run.task} failed (${note || `exit code ${code}`}) after ${secs}s`);
+      this.incidents.add({
+        key: run.logKey,
+        kind: 'task-failed',
+        severity: 'error',
+        title: `task "${run.task}" failed (${note || `exit code ${code}`})`,
+        detail: run.run,
+        exitCode: code,
+        context: this.logs.recent(run.logKey, 40),
+      });
+    }
+    const { _done, ...plain } = run as any;
+    void _done;
+    this.emit({ type: 'task', run: plain });
+    const rt = this.runtimes.get(run.logKey);
+    if (rt) this.emitStatus(rt);
+  }
+
+  cancelTask(id: string): TaskRun {
+    const run = this.taskRuns.find((r) => r.id === id);
+    if (!run) throw new Error(`Unknown task run ${id}`);
+    const child = this.taskProcs.get(id);
+    if (run.status === 'running' && child?.pid) {
+      run.status = 'cancelled';
+      killTree(child.pid);
+    }
+    return run;
+  }
+
   // ------------------------------------------------------------------ stop
 
   async stop(key: string): Promise<{ ok: boolean; key: string; status: ServiceStatus; note?: string }> {
@@ -659,6 +901,7 @@ export class Supervisor {
     }
     clearTimeout(rt.restartTimer);
     clearTimeout(rt.readyTimer);
+    rt.startSeq++;
     rt.stopping = true;
     if (rt.status === 'backoff' || (!rt.pid && !rt.child)) {
       this.setStatus(rt, 'stopped');

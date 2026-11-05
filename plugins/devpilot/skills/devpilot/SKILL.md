@@ -25,6 +25,8 @@ the web dashboard (`devpilot open`) and the Claude desktop panel.
 | What went wrong | `devpilot incidents --open --json`, `devpilot diagnose api --json` |
 | Resource history | `devpilot metrics api --range 1h --json` |
 | Env | `devpilot env api --json` (secrets masked), `devpilot env use staging --restart` |
+| Modes (watch vs built output…) | `devpilot mode --json`; `devpilot mode use build --restart`; one service: `devpilot mode use build api --restart` or `devpilot start api --mode build --wait --json`; back: `devpilot mode reset --restart` |
+| One-shot tasks (install, build, migrate) | `devpilot task --json` lists them; `devpilot task run install api` (follows output, exit code = task's); every service: `devpilot task run install --all` |
 | Ports | `devpilot ports --json`; `devpilot ports kill 3000 --force` (see rules) |
 | No devpilot.yaml yet | use the `devpilot:setup` skill |
 | Config reference | `devpilot help config` |
@@ -38,6 +40,11 @@ anything else. Services are named as in `devpilot.yaml`; from another folder use
 
 - Start services through DevPilot, not with `npm run dev &` / background Bash, so they
   are supervised, logged and visible to the user.
+- When a service defines a task for what you need (install, build, migrate), run it with
+  `devpilot task run <task> <service>` rather than the raw command: its output lands in the
+  service log the user watches, and `stop_service` tasks free files the service holds.
+- A mode switch changes how a service runs for the user too: do it when asked, and say
+  which services restart.
 - Never kill a process you did not start. `devpilot ports kill … --force` only after the
   user agreed to stop that specific PID (show them name and command line first).
 - `devpilot down` / `unregister` stop the user's running services: only when asked.

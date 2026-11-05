@@ -53,6 +53,12 @@ export interface ServiceView {
   openIncidents: number;
   /** Waiting for its dependencies before it is spawned. */
   queued?: boolean;
+  /** Active mode ("default" = the plain config) and the ones it defines. */
+  mode: string;
+  modes: string[];
+  /** One-shot tasks the service defines, and the one running now if any. */
+  tasks: string[];
+  task?: string;
 }
 
 export interface WorkspaceView {
@@ -65,9 +71,33 @@ export interface WorkspaceView {
   envProfiles: string[];
   configError?: string;
   services: ServiceView[];
+  /** Workspace-wide mode ("default" unless switched) and every mode some service defines. */
+  mode: string;
+  modes: string[];
+  /** Workspace-level task names, and the union of the services' task names. */
+  tasks: string[];
+  serviceTasks: string[];
+  runningTasks: TaskRun[];
 }
 
-export type IncidentKind = 'crash' | 'start-failed' | 'unhealthy' | 'error-log' | 'memory' | 'port-conflict';
+export type IncidentKind = 'crash' | 'start-failed' | 'unhealthy' | 'error-log' | 'memory' | 'port-conflict' | 'task-failed';
+
+export interface TaskRun {
+  id: string;
+  workspace: string;
+  service?: string;
+  task: string;
+  run: string;
+  cwd: string;
+  status: 'running' | 'ok' | 'failed' | 'cancelled';
+  startedAt: number;
+  endedAt?: number;
+  exitCode?: number | null;
+  /** Log stream the output went to: the service's, or "<workspace>/tasks". */
+  logKey: string;
+  /** Why it ran: by hand, or before a service start in some mode. */
+  reason: 'manual' | 'before-start';
+}
 
 export interface Incident {
   id: string;
@@ -106,4 +136,5 @@ export type DaemonEvent =
   | { type: 'incident'; incident: Incident }
   | { type: 'metrics'; key: string; point: MetricPoint }
   | { type: 'log'; key: string; lines: LogLine[] }
-  | { type: 'workspaces'; workspaces: string[] };
+  | { type: 'workspaces'; workspaces: string[] }
+  | { type: 'task'; run: TaskRun };

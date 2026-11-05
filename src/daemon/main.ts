@@ -35,7 +35,19 @@ async function main() {
     }
   }
 
-  const token = crypto.randomBytes(24).toString('hex');
+  // The token outlives daemon restarts, so dashboard logins (a cookie holding
+  // it) and the panel keep working; delete ~/.devpilot/token to revoke them all.
+  const tokenFile = path.join(paths.home, 'token');
+  let token = '';
+  try {
+    token = fs.readFileSync(tokenFile, 'utf8').trim();
+  } catch {
+    /* first run */
+  }
+  if (!/^[0-9a-f]{48}$/.test(token)) {
+    token = crypto.randomBytes(24).toString('hex');
+    fs.writeFileSync(tokenFile, token, { mode: 0o600 });
+  }
   const startedAt = Date.now();
   const sup = new Supervisor();
   const port = await pickPort();

@@ -31,6 +31,35 @@ const healthSchema = z
   })
   .strict();
 
+const nameKey = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'names: letters, digits, . _ -');
+
+/** A one-shot command: yarn install, yarn build, a migration... */
+const taskSchema = z.union([
+  z.string(),
+  z
+    .object({
+      run: z.string(),
+      cwd: z.string().optional(),
+      timeout: duration.optional(),
+      stop_service: z.boolean().optional(), // stop the service while it runs (file locks on Windows), start it again after
+      description: z.string().optional(),
+    })
+    .strict(),
+]);
+
+/** An alternative way to run a service: watch vs built output vs prod. */
+const modeSchema = z
+  .object({
+    run: z.string().optional(),
+    env: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+    env_files: stringList.optional(),
+    ready: z.object({ log: z.string().optional(), timeout: duration.optional() }).strict().optional(),
+    health: healthSchema.optional(),
+    before: stringList.optional(), // task names run, in order, before the process starts
+    description: z.string().optional(),
+  })
+  .strict();
+
 const serviceSchema = z
   .object({
     run: z.string().optional(),
@@ -59,6 +88,8 @@ const serviceSchema = z
     alerts: z.object({ mem_mb: z.number().optional(), unhealthy_after: z.number().int().optional(), error_patterns: z.array(z.string()).optional() }).strict().optional(),
     autostart: z.boolean().optional(),
     group: z.string().optional(), // display group in the panel/dashboard
+    modes: z.record(nameKey, modeSchema).optional(),
+    tasks: z.record(nameKey, taskSchema).optional(),
   })
   .strict()
   .refine((s) => s.run || s.compose, { message: 'each service needs `run` or `compose`' });
@@ -71,11 +102,35 @@ const fileSchema = z
     env: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
     env_profiles: z.record(z.string(), z.object({ env_files: stringList.optional(), env: z.record(z.string(), z.string()).optional() })).optional(),
     profiles: z.record(z.string(), z.array(z.string())).optional(),
+    tasks: z.record(nameKey, taskSchema).optional(),
     services: z.record(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'service names: letters, digits, . _ -'), serviceSchema),
   })
   .strict();
 
 export type ConfigFile = z.infer<typeof fileSchema>;
+
+export interface TaskSpec {
+  name: string;
+  run: string;
+  cwd: string;
+  timeoutMs: number;
+  stopService: boolean;
+  description?: string;
+}
+
+export interface ModeSpec {
+  name: string;
+  run?: string;
+  env: Record<string, string>;
+  envFiles: string[];
+  readyLog?: RegExp;
+  readyTimeoutMs?: number;
+  health?: ServiceSpec['health'];
+  before: string[];
+  description?: string;
+}
+
+export const DEFAULT_MODE = 'default';
 
 export interface ServiceSpec {
   name: string;
@@ -96,6 +151,12 @@ export interface ServiceSpec {
   autostart: boolean;
   group?: string;
   compose?: { file: string; services: string[] };
+  modes: Record<string, ModeSpec>;
+  tasks: Record<string, TaskSpec>;
+  /** Mode this spec was resolved for (DEFAULT_MODE for the plain config). */
+  mode: string;
+  /** Tasks to run before spawning, from the active mode. */
+  before: string[];
 }
 
 export interface WorkspaceConfig {
@@ -106,6 +167,12 @@ export interface WorkspaceConfig {
   profiles: Record<string, string[]>;
   envProfiles: string[];
   services: ServiceSpec[];
+  /** Workspace-level tasks (cwd = workspace root). */
+  tasks: Record<string, TaskSpec>;
+  /** Every mode some service defines, plus DEFAULT_MODE. */
+  modes: string[];
+  env: Record<string, string>;
+  envFiles: string[];
 }
 
 /** Stable, readable id: folder name + short hash of the absolute path. */
@@ -152,19 +219,25 @@ export function parseConfig(text: string, configPath: string): WorkspaceConfig {
     for (const dep of s.depends_on || []) {
       if (!names.includes(dep)) throw new Error(`service "${name}" depends on unknown service "${dep}"`);
     }
-    let health: ServiceSpec['health'];
-    if (s.health?.http) {
-      health = {
-        kind: 'http',
-        target: s.health.http,
-        expect: s.health.expect === undefined ? [] : ([] as number[]).concat(s.health.expect),
-        intervalMs: parseDuration(s.health.interval, 5000),
-        timeoutMs: parseDuration(s.health.timeout, 2000),
+    const health = parseHealth(s.health, s.port);
+    const tasks = parseTasks(s.tasks, cwd);
+    const modes: Record<string, ModeSpec> = {};
+    for (const [m, v] of Object.entries(s.modes || {})) {
+      if (m === DEFAULT_MODE) throw new Error(`service "${name}": "${DEFAULT_MODE}" is the plain config and cannot be redefined as a mode`);
+      for (const t of v.before || []) {
+        if (!tasks[t] && !(file.tasks && file.tasks[t])) throw new Error(`service "${name}" mode "${m}" runs unknown task "${t}" before starting`);
+      }
+      modes[m] = {
+        name: m,
+        run: v.run,
+        env: strEnv(v.env),
+        envFiles: (v.env_files || []).map((f) => abs(cwd, f)),
+        readyLog: v.ready?.log ? new RegExp(v.ready.log) : undefined,
+        readyTimeoutMs: v.ready?.timeout !== undefined ? parseDuration(v.ready.timeout, 120_000) : undefined,
+        health: v.health ? parseHealth(v.health, s.port) : undefined,
+        before: v.before || [],
+        description: v.description,
       };
-    } else if (s.health?.tcp || (s.health && s.port)) {
-      health = { kind: 'tcp', target: s.health.tcp ?? s.port!, expect: [], intervalMs: parseDuration(s.health.interval, 5000), timeoutMs: parseDuration(s.health.timeout, 1500) };
-    } else if (s.port) {
-      health = { kind: 'tcp', target: s.port, expect: [], intervalMs: 5000, timeoutMs: 1500 };
     }
     const profiles: ServiceSpec['envProfiles'] = {};
     for (const [p, v] of Object.entries(globalProfiles)) profiles[p] = { envFiles: (v.env_files || []).map((f) => abs(root, f)), env: v.env || {} };
@@ -202,6 +275,10 @@ export function parseConfig(text: string, configPath: string): WorkspaceConfig {
       autostart: s.autostart ?? false,
       group: s.group,
       compose,
+      modes,
+      tasks,
+      mode: DEFAULT_MODE,
+      before: [],
     };
   });
 
@@ -214,6 +291,9 @@ export function parseConfig(text: string, configPath: string): WorkspaceConfig {
   const envProfiles = new Set<string>(Object.keys(globalProfiles));
   for (const s of services) Object.keys(s.envProfiles).forEach((p) => envProfiles.add(p));
 
+  const modeNames = new Set<string>([DEFAULT_MODE]);
+  for (const s of services) Object.keys(s.modes).forEach((m) => modeNames.add(m));
+
   return {
     id: workspaceId(root),
     name: file.name || path.basename(root),
@@ -222,6 +302,58 @@ export function parseConfig(text: string, configPath: string): WorkspaceConfig {
     profiles,
     envProfiles: [...envProfiles],
     services,
+    tasks: parseTasks(file.tasks, root),
+    modes: [...modeNames],
+    env: strEnv(file.env),
+    envFiles: (file.env_files || []).map((f) => abs(root, f)),
+  };
+}
+
+function parseHealth(h: z.infer<typeof healthSchema> | undefined, port: number | undefined): ServiceSpec['health'] {
+  if (h?.http) {
+    return {
+      kind: 'http',
+      target: h.http,
+      expect: h.expect === undefined ? [] : ([] as number[]).concat(h.expect),
+      intervalMs: parseDuration(h.interval, 5000),
+      timeoutMs: parseDuration(h.timeout, 2000),
+    };
+  }
+  if (h?.tcp || (h && port)) return { kind: 'tcp', target: h.tcp ?? port!, expect: [], intervalMs: parseDuration(h.interval, 5000), timeoutMs: parseDuration(h.timeout, 1500) };
+  if (port) return { kind: 'tcp', target: port, expect: [], intervalMs: 5000, timeoutMs: 1500 };
+  return undefined;
+}
+
+function parseTasks(raw: Record<string, z.infer<typeof taskSchema>> | undefined, cwd: string): Record<string, TaskSpec> {
+  const out: Record<string, TaskSpec> = {};
+  for (const [name, t] of Object.entries(raw || {})) {
+    const o = typeof t === 'string' ? { run: t } : t;
+    out[name] = {
+      name,
+      run: o.run,
+      cwd: path.resolve(cwd, ('cwd' in o && o.cwd) || '.'),
+      timeoutMs: parseDuration('timeout' in o ? o.timeout : undefined, 30 * 60_000),
+      stopService: ('stop_service' in o && o.stop_service) || false,
+      description: 'description' in o ? o.description : undefined,
+    };
+  }
+  return out;
+}
+
+/** The spec a service runs with in `mode` (unknown or default mode: the plain config). */
+export function applyMode(spec: ServiceSpec, mode: string | undefined): ServiceSpec {
+  const m = mode && mode !== DEFAULT_MODE ? spec.modes[mode] : undefined;
+  if (!m) return { ...spec, mode: DEFAULT_MODE, before: [] };
+  return {
+    ...spec,
+    mode: m.name,
+    run: m.run ?? spec.run,
+    env: { ...spec.env, ...m.env },
+    envFiles: [...spec.envFiles, ...m.envFiles],
+    readyLog: m.readyLog ?? spec.readyLog,
+    readyTimeoutMs: m.readyTimeoutMs ?? spec.readyTimeoutMs,
+    health: m.health ?? spec.health,
+    before: m.before,
   };
 }
 

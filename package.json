@@ -1,6 +1,6 @@
 {
   "name": "devpilot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Run and monitor local dev services (any runtime) from Claude Code, a web dashboard and a Claude desktop panel.",
   "type": "module",
@@ -26,7 +26,6 @@
     "@hono/node-server": "^2.1.6",
     "hono": "^4.13.16",
     "preact": "^11.1.1",
-    "uplot": "^1.6.32",
     "yaml": "^2.9.1",
     "zod": "^4.6.7"
   },

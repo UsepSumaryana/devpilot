@@ -54,6 +54,39 @@ di settings Claude Anda (opsional).
 Di luar Claude, CLI bisa dipakai langsung: `node plugins/devpilot/dist/cli.js`, atau jalankan `npm link`
 di clone repo ini supaya perintah `devpilot` tersedia di PATH.
 
+## Update
+
+**Dipasang dari GitHub** (`marketplace add UsepSumaryana/devpilot`):
+
+```bash
+claude plugin marketplace update devpilot
+```
+
+```bash
+claude plugin update devpilot@devpilot
+```
+
+```bash
+claude plugin update devpilot-panel@devpilot
+```
+
+Lalu, di sesi Claude yang sedang terbuka, jalankan `/reload-plugins` atau buka sesi baru.
+
+**Dipasang dari clone lokal** (`marketplace add <path-ke-clone>`): plugin dibaca langsung dari folder,
+jadi cukup `git pull` di clone, lalu `/reload-plugins`. `plugin update` tidak perlu.
+
+**Setelah update, restart daemon** supaya daemon memakai kode baru. Service yang sedang jalan tetap hidup
+dan di-adopsi ulang:
+
+```bash
+devpilot daemon restart
+```
+
+Dashboard yang sedang terbuka perlu di-refresh penuh (Ctrl+F5); login 30 hari tetap berlaku.
+
+Cek versi yang terpasang: `claude plugin list` (plugin), `devpilot version` (CLI), dan `devpilot daemon status`
+(daemon yang sedang berjalan). Kalau versi daemon lebih lama dari CLI, berarti daemon belum di-restart.
+
 ## Mulai cepat
 
 Di folder proyek:
@@ -116,6 +149,42 @@ services:
 
 Referensi lengkap: `devpilot help config`.
 
+### Mode dan task
+
+**Task** adalah perintah sekali jalan, misalnya `yarn install`, build, atau migrasi. **Mode** adalah cara lain menjalankan
+sebuah service, misalnya watch atau hasil build. Field yang tidak diisi dalam mode memakai config biasa (mode `default`).
+
+```yaml
+tasks:                              # level workspace, cwd = folder devpilot.yaml
+  install: yarn install
+services:
+  api:
+    run: yarn start:dev             # mode default (watch)
+    port: 3000
+    tasks:
+      build: yarn build
+      clean-install: { run: yarn install --force, stop_service: true }   # service dihentikan sementara
+    modes:
+      build:
+        run: node dist/main.js
+        before: [install, build]    # dijalankan dulu saat start sengaja (bukan saat restart karena crash)
+        env: { NODE_ENV: production }
+```
+
+```bash
+devpilot task                       # daftar task + riwayat run
+devpilot task run install           # task workspace, output diikuti sampai selesai
+devpilot task run build api         # task milik service api
+devpilot task run install --all     # di setiap service yang punya task install
+devpilot mode use build --restart   # semua service yang punya mode build
+devpilot start api --mode build     # satu service saja
+devpilot mode reset --restart       # kembali ke mode default
+```
+
+Di panel, mode aktif tampil di samping nama service, dan menu ⋯ berisi pilihan **MODE** serta **TASKS**.
+Di dashboard tersedia pilihan mode dan tombol task, baik di overview maupun di halaman service.
+`devpilot init` otomatis menambahkan task `install`/`build`, dan mode `build` bila script proyek memungkinkan.
+
 ## Perintah
 
 | Perintah | Fungsi |
@@ -130,6 +199,8 @@ Referensi lengkap: `devpilot help config`.
 | `devpilot diagnose <svc>` | Laporan triage: verdict, temuan + saran, error block, pemegang port, env yang hilang |
 | `devpilot metrics <svc> [--range]` | Histori CPU/RAM/latency |
 | `devpilot env [svc] \| env use <profile> [--restart]` | Env yang dipakai / ganti env profile |
+| `devpilot mode \| mode use <mode> [svc…] [--restart] \| mode reset` | Lihat / ganti mode (watch, build, prod…) |
+| `devpilot task \| task run <task> [svc] [--all] [--detach] \| task cancel <id>` | Jalankan task sekali jalan (install, build, migrasi) |
 | `devpilot ports [--all] \| ports kill <port> --force` | Siapa memakai port mana |
 | `devpilot open [svc]` | Dashboard (link login sekali pakai) |
 | `devpilot watch` | Stream incident (dipakai monitor Claude) |

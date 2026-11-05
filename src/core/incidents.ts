@@ -150,6 +150,16 @@ export class IncidentStore {
   get(id: string) {
     return this.list.find((i) => i.id === id);
   }
+
+  /** Mark one incident resolved. */
+  resolveId(id: string): Incident | undefined {
+    const i = this.get(id);
+    if (i && !i.resolvedAt) {
+      i.resolvedAt = Date.now();
+      this.rewrite();
+    }
+    return i;
+  }
 }
 
 /**

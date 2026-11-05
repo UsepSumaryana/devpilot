@@ -17,14 +17,21 @@ const SUMMARY = {
       id: 'demo-abc123',
       name: 'demo',
       envProfile: null,
+      mode: 'default',
+      modes: ['default', 'build'],
+      tasks: ['install'],
+      serviceTasks: ['install'],
+      runningTasks: [],
       services: [
-        { key: 'demo-abc123/api', name: 'api', status: 'running', port: 4510, url: 'http://localhost:4510', health: { state: 'ok', latencyMs: 2 }, cpu: 0.5, mem: 64 * 1048576, restarts: 0, openIncidents: 0 },
+        { key: 'demo-abc123/api', name: 'api', status: 'running', mode: 'build', modes: ['default', 'build'], tasks: ['install'], port: 4510, url: 'http://localhost:4510', health: { state: 'ok', latencyMs: 2 }, cpu: 0.5, mem: 64 * 1048576, restarts: 0, openIncidents: 0 },
         { key: 'demo-abc123/worker', name: 'worker', status: 'crashed', health: { state: 'none' }, restarts: 2, exitCode: 1, lastError: 'Error: boom', openIncidents: 1 },
         { key: 'demo-abc123/web', name: 'web', status: 'stopped', queued: true, dependsOn: ['api'], health: { state: 'none' }, restarts: 0, openIncidents: 0 },
       ],
     },
   ],
 }
+
+const posts: string[] = []
 
 function engine(on: any, { daemonUp }: { daemonUp: boolean }) {
   on('command.register', () => ({ value: {} }))
@@ -40,6 +47,7 @@ function engine(on: any, { daemonUp }: { daemonUp: boolean }) {
   })
   on('http.fetch', (_: any, e: any) => {
     const url = String(e.url)
+    if (e.init?.method === 'POST' || e.method === 'POST') posts.push(url.replace(/^https?:\/\/[^/]+/, ''))
     const body = url.includes('/api/resolve') ? { workspace: 'demo-abc123' } : SUMMARY
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } }
   })
@@ -94,6 +102,27 @@ test('daemon up: rows for each service, with the right actions', async ($, on) =
     expect(await ui.find({ type: 'Text', text: /^queued$/ })).toBeTruthy()
     expect(await ui.find({ type: 'Button', key: 'dequeue-demo-abc123/web' })).toBeTruthy()
     expect(await ui.find({ type: 'Text', text: /1 of 3 up/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^build$/ })).toBeTruthy()
     await ui.unmount()
   }
+})
+
+test('actions ask first: Cancel sends nothing, Confirm sends the request', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  posts.length = 0
+
+  await ui.press({ key: 'stop-demo-abc123/api' })
+  expect(await ui.find({ type: 'Text', text: /^Stop api\?$/ })).toBeTruthy()
+  expect(posts.filter((p) => p.includes('/stop'))).toHaveLength(0)
+
+  await ui.press({ key: 'confirm-cancel' })
+  expect(await ui.find({ type: 'Text', text: /^Stop api\?$/ })).toBeFalsy()
+  expect(posts.filter((p) => p.includes('/stop'))).toHaveLength(0)
+
+  await ui.press({ key: 'stop-demo-abc123/api' })
+  await ui.press({ key: 'confirm-ok' })
+  expect(posts.filter((p) => p.includes('/api/services/demo-abc123/api/stop'))).toHaveLength(1)
+  await ui.unmount()
 })

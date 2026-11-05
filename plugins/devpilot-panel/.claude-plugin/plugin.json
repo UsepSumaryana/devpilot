@@ -1,6 +1,6 @@
 {
   "name": "devpilot-panel",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A live DevPilot pane beside the chat: service status, health, CPU/memory, one-click start/stop/restart, crash notifications.",
   "types": "./types/index.d.ts",
   "author": {

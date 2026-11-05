@@ -162,7 +162,7 @@ const commands: Record<string, Handler> = {
       if (view.profiles[a] && !profile && !services) profile = a;
       else (services ||= []).push(a);
     }
-    const res = await api.post(`/api/workspaces/${ws}/up`, { profile, services, wait: !!args.flags.wait }, 15 * 60_000);
+    const res = await api.post(`/api/workspaces/${ws}/up`, { profile, services, wait: !!args.flags.wait, mode: str(args.flags.mode) }, 15 * 60_000);
     const failed = res.filter((r: any) => !r.ok);
     print(() => res.map(startLine).join('\n') + (args.flags.wait || failed.length ? '' : color.dim('\n(started; readiness continues in the background — `devpilot status` or add --wait)')), res);
     if (failed.length) process.exitCode = 1;
@@ -186,7 +186,7 @@ const commands: Record<string, Handler> = {
     const out: any[] = [];
     for (const ref of args._.slice(1).length ? args._.slice(1) : [undefined]) {
       const key = await resolveKey(api, ref, args);
-      out.push(await api.post(`${svcUrl(key)}/start`, { wait: !!args.flags.wait, deps: !args.flags['no-deps'], timeoutMs: duration(args.flags.timeout) }, 15 * 60_000));
+      out.push(await api.post(`${svcUrl(key)}/start`, { wait: !!args.flags.wait, deps: !args.flags['no-deps'], timeoutMs: duration(args.flags.timeout), mode: str(args.flags.mode) }, 15 * 60_000));
     }
     print(() => out.map(startLine).join('\n'), out.length === 1 ? out[0] : out);
     if (out.some((r) => !r.ok)) process.exitCode = 1;
@@ -223,6 +223,8 @@ const commands: Record<string, Handler> = {
           [
             `${STATUS_ICON[s.status]} ${color.bold(s.name)} ${s.status}  ${color.dim(s.key)}`,
             `  run      ${s.run}`,
+            `  mode     ${s.mode}${s.modes.length > 1 ? color.dim(`  (available: ${s.modes.join(', ')})`) : ''}`,
+            s.tasks.length ? `  tasks    ${s.tasks.join(', ')}${s.task ? color.cyan(`  — running: ${s.task}`) : ''}` : '',
             `  cwd      ${s.cwd}`,
             s.port ? `  port     ${s.port}${s.url ? `  ${s.url}` : ''}` : '',
             `  health   ${healthText(s)}${s.health.lastError ? color.dim(` (${s.health.lastError})`) : ''}`,
@@ -396,7 +398,7 @@ const commands: Record<string, Handler> = {
     if (args._[1]) to = `/#/service/${await resolveKey(api, args._[1], args)}`;
     const url = `${api.baseUrl}/auth?code=${code}&to=${encodeURIComponent(to)}`;
     const opened = !args.flags['no-browser'] && openUrl(url);
-    print(`${opened ? 'Opened' : 'Open'} the dashboard: ${url}${opened ? '' : ''}\n${color.dim('(the link logs the browser in and expires in 60s)')}`, { url, opened });
+    print(`${opened ? 'Opened' : 'Open'} the dashboard: ${url}${opened ? '' : ''}\n${color.dim('(one-time link, valid 5 minutes; the browser then stays logged in for 30 days)')}`, { url, opened });
   },
 
   async watch(args) {
@@ -491,6 +493,98 @@ const commands: Record<string, Handler> = {
       for (const f of res.files.filter((f) => f.written)) await api.post('/api/workspaces', { path: f.path }).catch(() => undefined);
     }
     print(() => res.files.map((f) => `${f.written ? color.green('✔ wrote') : f.skipped ? color.yellow('• skipped') : color.dim('• would write')} ${f.path} (${f.services} services)${f.skipped ? color.dim(` — ${f.skipped}`) : ''}`).join('\n') + (args.flags.write ? '' : color.dim('\nDry run. Add --write to create the files.')), res);
+  },
+
+  async mode(args) {
+    const api = await connect();
+    const ws = await currentWorkspace(api, args);
+    const sub = args._[1];
+    if (sub === 'use' || sub === 'reset') {
+      const mode = sub === 'reset' ? 'default' : args._[2];
+      if (!mode) throw new CliError('usage: devpilot mode use <mode> [service...] [--restart]', 2);
+      const services = args._.slice(sub === 'reset' ? 2 : 3);
+      const r = await api.post(`/api/workspaces/${ws}/mode`, { mode, services: services.length ? services : undefined, restart: !!args.flags.restart });
+      const name = (k: string) => k.split('/')[1];
+      print(
+        () =>
+          `${color.green('✔')} mode ${color.bold(mode)}${services.length ? ` for ${services.join(', ')}` : ' for the workspace'}` +
+          (r.changed.length ? `\n  changed: ${r.changed.map(name).join(', ')}` : color.dim('\n  (no service changed mode)')) +
+          (r.restarted.length ? `\n  restarting: ${r.restarted.map(name).join(', ')}` : '') +
+          (r.needsRestart.length ? color.yellow(`\n  running with the old mode until restarted: ${r.needsRestart.map(name).join(', ')} (add --restart)`) : ''),
+        r,
+      );
+      return;
+    }
+    const view: WorkspaceView = (await api.get(`/api/summary?ws=${ws}`)).workspaces[0];
+    print(
+      () =>
+        [
+          `workspace mode: ${color.bold(view.mode)}   available: ${view.modes.join(', ')}`,
+          '',
+          table([[color.dim('SERVICE'), color.dim('MODE'), color.dim('MODES')], ...view.services.map((s) => [s.name, s.mode === 'default' ? color.dim(s.mode) : color.cyan(s.mode), color.dim(s.modes.join(', '))])]),
+          '',
+          color.dim('switch: devpilot mode use <mode> [service...] [--restart]   ·   back: devpilot mode reset [service...]'),
+        ].join('\n'),
+      { mode: view.mode, modes: view.modes, services: view.services.map((s) => ({ name: s.name, mode: s.mode, modes: s.modes })) },
+    );
+  },
+
+  async task(args) {
+    const api = await connect();
+    const ws = await currentWorkspace(api, args);
+    const sub = args._[1];
+    if (!sub || sub === 'list' || sub === 'ls') {
+      const info = await api.get(`/api/workspaces/${ws}/tasks`);
+      print(() => {
+        const lines: string[] = [];
+        if (info.workspace.length) lines.push(color.bold('Workspace tasks'), ...info.workspace.map((t: any) => `  ${t.name.padEnd(14)} ${color.dim(t.run)}`));
+        for (const [svc, ts] of Object.entries(info.services) as [string, any[]][]) lines.push(color.bold(svc), ...ts.map((t) => `  ${t.name.padEnd(14)} ${color.dim(t.run)}${t.stopService ? color.dim(' (stops the service)') : ''}`));
+        if (!lines.length) lines.push('No tasks defined. Add `tasks:` to devpilot.yaml (see `devpilot help config`).');
+        if (info.runs.length) {
+          lines.push('', color.bold('Recent runs'));
+          for (const r of info.runs.slice(0, 10)) {
+            const st = r.status === 'ok' ? color.green('✔') : r.status === 'running' ? color.cyan('◌') : r.status === 'cancelled' ? color.dim('■') : color.red('✖');
+            lines.push(`  ${st} ${r.task}${r.service ? ` (${r.service})` : ''} ${color.dim(`${ago(r.startedAt)} ago${r.endedAt ? `, ${((r.endedAt - r.startedAt) / 1000).toFixed(1)}s` : ''}`)} ${color.dim(`[${r.id}]`)}`);
+          }
+        }
+        return lines.join('\n');
+      }, info);
+      return;
+    }
+    if (sub === 'cancel') {
+      const r = await api.post(`/api/tasks/${args._[2]}/cancel`);
+      print(`■ ${r.task} ${r.status}`, r);
+      return;
+    }
+    // devpilot task run <task> [service] | devpilot task <task> [service]
+    const name = sub === 'run' ? args._[2] : sub;
+    const service = sub === 'run' ? args._[3] : args._[2];
+    if (!name) throw new CliError('usage: devpilot task run <task> [service] [--all] [--detach]', 2);
+    if (args.flags.all) {
+      const r = await api.post(`/api/workspaces/${ws}/tasks`, { task: name, all: true, wait: !args.flags.detach }, 60 * 60_000);
+      print(() => (Array.isArray(r) ? r.map((x: any) => `${x.status === 'ok' ? color.green('✔') : color.red('✖')} ${name} (${x.service})`).join('\n') : `started ${name} for ${r.services.join(', ')}`), r);
+      if (Array.isArray(r) && r.some((x: any) => x.status !== 'ok')) process.exitCode = 1;
+      return;
+    }
+    // Where its output will land, so following starts exactly at this run.
+    const logKey = service ? `${ws}/${service}` : `${ws}/tasks`;
+    let after: number | undefined = (await api.get(`/api/services/${logKey}/logs?tail=1`)).lastSeq;
+    const run = await api.post(`/api/workspaces/${ws}/tasks`, { task: name, service });
+    if (args.flags.detach) {
+      print(`started task ${name} [${run.id}] — logs: devpilot logs ${run.logKey}`, run);
+      return;
+    }
+    let cur: any = run;
+    for (;;) {
+      const logs: any = await api.get(`/api/services/${run.logKey}/logs?after=${after ?? 0}`);
+      after = logs.lastSeq;
+      if (!JSON_MODE) for (const l of logs.lines) console.log((l.stream === 'err' ? color.red('│ ') : l.stream === 'sys' ? color.cyan('│ ') : color.dim('│ ')) + l.text);
+      if (cur.status !== 'running') break;
+      await new Promise((r) => setTimeout(r, 500));
+      cur = await api.get(`/api/tasks/${run.id}`);
+    }
+    if (JSON_MODE) print('', cur);
+    if (cur.status !== 'ok') process.exitCode = typeof cur.exitCode === 'number' && cur.exitCode > 0 ? cur.exitCode : 1;
   },
 
   async help(args) {

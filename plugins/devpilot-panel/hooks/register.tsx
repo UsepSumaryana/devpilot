@@ -4,16 +4,17 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Row, Scope, Snapshot, Ws } from '../types'
+import type { Confirm, Row, Scope, Snapshot, Ws } from '../types'
 
 const PANE = 'devpilot'
 const EMPTY: Snapshot = { daemon: 'unknown', detail: null, projectWs: null, workspaces: [], openIncidents: 0, updatedAt: 0 }
 
 // Bump a tag when the stored shape changes: the old value is declined.
-const snapshot = atom({ plugin: 'devpilot-panel', key: 'snapshot' } as const, EMPTY, { shape: 'snapshot-3' })
+const snapshot = atom({ plugin: 'devpilot-panel', key: 'snapshot' } as const, EMPTY, { shape: 'snapshot-5' })
 const scope = atom({ plugin: 'devpilot-panel', key: 'scope' } as const, 'project' as Scope, { shape: 'scope-1' })
 const busy = atom({ plugin: 'devpilot-panel', key: 'busy' } as const, null as string | null, { shape: 'busy-1' })
 const menu = atom({ plugin: 'devpilot-panel', key: 'menu' } as const, false, { shape: 'menu-1' })
+const confirm = atom({ plugin: 'devpilot-panel', key: 'confirm' } as const, null as Confirm | null, { shape: 'confirm-1' })
 
 type Daemon = { port: number; token: string }
 
@@ -74,6 +75,24 @@ function toRow(s: any): Row {
     dependsOn: Array.isArray(s.dependsOn) ? s.dependsOn : [],
     group: s.group ?? null,
     queued: s.queued === true,
+    mode: typeof s.mode === 'string' ? s.mode : 'default',
+    modes: Array.isArray(s.modes) ? s.modes : ['default'],
+    task: typeof s.task === 'string' ? s.task : null,
+    tasks: Array.isArray(s.tasks) ? s.tasks : [],
+  }
+}
+
+function toWs(w: any): Ws {
+  return {
+    id: w.id,
+    name: w.name,
+    envProfile: w.envProfile ?? null,
+    services: (w.services || []).map(toRow),
+    mode: typeof w.mode === 'string' ? w.mode : 'default',
+    modes: Array.isArray(w.modes) ? w.modes : ['default'],
+    tasks: Array.isArray(w.tasks) ? w.tasks : [],
+    serviceTasks: Array.isArray(w.serviceTasks) ? w.serviceTasks : [],
+    runningTasks: (w.runningTasks || []).map((t: any) => (t.service ? `${t.task} (${t.service})` : t.task)),
   }
 }
 
@@ -111,7 +130,7 @@ async function poll($: EngineInterface) {
         /* retry next poll */
       }
     }
-    const workspaces: Ws[] = (sum.workspaces || []).map((w: any) => ({ id: w.id, name: w.name, envProfile: w.envProfile ?? null, services: (w.services || []).map(toRow) }))
+    const workspaces: Ws[] = (sum.workspaces || []).map(toWs)
     if (projectWs === null && workspaces.length && resolvedOnce) resolvedOnce = false // registered later? look again
     await update($, snapshot, (): Snapshot => ({ daemon: 'up', detail: null, projectWs, workspaces, openIncidents: (sum.incidents || []).length, updatedAt: Date.now() }))
 
@@ -157,6 +176,31 @@ async function act($: EngineInterface, label: string, method: string, path: stri
     await poll($)
   }
 }
+
+/** Ask before anything that changes what runs: the press shows a confirmation card first. */
+async function propose($: EngineInterface, c: Confirm) {
+  await update($, confirm, (): Confirm | null => c)
+}
+
+async function decide($: EngineInterface, ok: boolean) {
+  const c = await read($, confirm)
+  await update($, confirm, (): Confirm | null => null)
+  if (ok && c) await act($, c.busy, c.method, c.path, c.body ?? undefined)
+}
+
+/** Running services that (transitively) depend on `name`. */
+function runningDependents(name: string, services: Row[]): string[] {
+  const out = new Set<string>()
+  let frontier = [name]
+  while (frontier.length) {
+    const next: string[] = []
+    for (const r of services) if (!out.has(r.name) && r.dependsOn.some((d) => frontier.includes(d))) (out.add(r.name), next.push(r.name))
+    frontier = next
+  }
+  return services.filter((r) => out.has(r.name) && LIVE.includes(r.status)).map((r) => r.name)
+}
+
+const listed = (names: string[], max = 4) => (names.length > max ? `${names.slice(0, max).join(', ')} +${names.length - max}` : names.join(', '))
 
 async function openUrl($: EngineInterface, url: string) {
   const isWin = (await $.env.get('OS')) === 'Windows_NT'
@@ -227,6 +271,7 @@ const C = {
 type Kind = 'running' | 'starting' | 'queued' | 'failing' | 'stopped'
 
 function kindOf(r: Row): Kind {
+  if (r.task) return 'starting' // a task (install, build) is running for it
   if (r.queued) return 'queued'
   if (FAILING.includes(r.status)) return 'failing'
   if (r.status === 'running') return 'running'
@@ -435,6 +480,7 @@ export const register: Register = (on) => {
     const sc = await read($, scope)
     const working = await read($, busy)
     const menuOpen = await read($, menu)
+    const pending = await read($, confirm)
 
     // Svg where the surface draws it, a glyph elsewhere (the terminal).
     const pic = (source: string, alt: string, glyph: string, color: string, pw: number, ph: number) =>
@@ -472,7 +518,7 @@ export const register: Register = (on) => {
       )
     }
 
-    const serviceRow = (r: Row) => {
+    const serviceRow = (r: Row, all: Row[]) => {
       const k = kindOf(r)
       const bg = k === 'failing' ? C.failRowBg : k === 'starting' ? C.blueBg : undefined
       const right =
@@ -482,7 +528,7 @@ export const register: Register = (on) => {
           </Text>
         ) : k === 'starting' ? (
           <Text size="caption" color={C.blue}>
-            {r.status === 'stopping' ? 'stopping' : 'starting'}
+            {r.task ? `${r.task}…` : r.status === 'stopping' ? 'stopping' : 'starting'}
           </Text>
         ) : k === 'queued' ? (
           <Text size="caption" color={C.muted}>
@@ -499,13 +545,19 @@ export const register: Register = (on) => {
         ) : null
       const action =
         k === 'failing' ? (
-          <Button key={`restart-${r.key}`} plain label="↻" onPress={() => act($, `Restarting ${r.name}`, 'POST', `/api/services/${r.key}/restart`, { background: true })} />
+          <Button key={`restart-${r.key}`} plain label="↻" onPress={() => propose($, { title: `Restart ${r.name}?`, detail: `Stops it and starts it again${r.mode !== 'default' ? ` in mode ${r.mode} (its tasks run first)` : ''}.`, label: 'Restart', danger: false, method: 'POST', path: `/api/services/${r.key}/restart`, body: { background: true }, busy: `Restarting ${r.name}` })} />
         ) : k === 'queued' ? (
-          <Button key={`dequeue-${r.key}`} plain label="✕" onPress={() => act($, `Removing ${r.name} from the queue`, 'POST', `/api/services/${r.key}/stop`)} />
+          <Button key={`dequeue-${r.key}`} plain label="✕" onPress={() => propose($, { title: `Remove ${r.name} from the queue?`, detail: 'It has not started yet and will not be started.', label: 'Remove', danger: true, method: 'POST', path: `/api/services/${r.key}/stop`, body: null, busy: `Removing ${r.name} from the queue` })} />
         ) : k === 'running' || k === 'starting' ? (
-          <Button key={`stop-${r.key}`} plain label="■" onPress={() => act($, `Stopping ${r.name}`, 'POST', `/api/services/${r.key}/stop`)} />
+          <Button key={`stop-${r.key}`} plain label="■" onPress={() => {
+              const deps = runningDependents(r.name, all)
+              return propose($, { title: `Stop ${r.name}?`, detail: `Kills its process tree.${deps.length ? ` Running services that depend on it: ${listed(deps)}.` : ''}`, label: 'Stop', danger: true, method: 'POST', path: `/api/services/${r.key}/stop`, body: null, busy: `Stopping ${r.name}` })
+            }} />
         ) : (
-          <Button key={`start-${r.key}`} plain label={'▶︎'} onPress={() => act($, `Starting ${r.name}`, 'POST', `/api/services/${r.key}/start`, { background: true })} />
+          <Button key={`start-${r.key}`} plain label={'▶︎'} onPress={() => {
+              const down = r.dependsOn.filter((d) => all.find((x) => x.name === d)?.status !== 'running')
+              return propose($, { title: `Start ${r.name}?`, detail: `${down.length ? `Dependencies start first: ${listed(down)}. ` : ''}Mode ${r.mode}.`, label: 'Start', danger: false, method: 'POST', path: `/api/services/${r.key}/start`, body: { background: true }, busy: `Starting ${r.name}` })
+            }} />
         )
       const glyphColor = k === 'running' ? 'success' : k === 'failing' ? 'error' : k === 'starting' ? C.blue : 'inactive'
       return (
@@ -515,6 +567,11 @@ export const register: Register = (on) => {
             <Text weight="medium" wrap="truncate-end">
               {r.name}
             </Text>
+            {r.mode !== 'default' && (
+              <Text size="footnote" weight="medium" color={C.blue}>
+                {r.mode}
+              </Text>
+            )}
           </Box>
           {right}
           {action}
@@ -539,7 +596,9 @@ export const register: Register = (on) => {
           const startingGroups = groups.filter((g) => g.rows.some((r) => kindOf(r) === 'starting')).map((g) => g.label.toLowerCase())
           const status = working
             ? { text: `${working}…`, color: C.muted }
-            : starting + queued > 0
+            : w.runningTasks.length
+              ? { text: `Running ${w.runningTasks.join(', ')}…`, color: C.blue }
+              : starting + queued > 0
               ? { text: `Starting ${startingGroups.join(', ') || 'services'}…`, color: C.blue }
               : null
           const tally = [failing.length && `${failing.length} ${failing.every((r) => r.status === 'crashed') ? 'crashed' : 'failing'}`, starting && `${starting} starting`, queued && `${queued} queued`, stopped && `${stopped} stopped`]
@@ -584,6 +643,62 @@ export const register: Register = (on) => {
                   {incidents > 0 && (
                     <Button key={`clear-${w.id}`} label={`Clear ${incidents} incident${incidents > 1 ? 's' : ''}`} onPress={() => act($, 'Clearing incidents', 'POST', '/api/incidents/resolve', { ws: w.id })} />
                   )}
+                </Box>
+              )}
+              {menuOpen && w.modes.length > 1 && (
+                <Box flexDirection="column" gap="xs">
+                  <Text size="footnote" weight="semibold" color={C.muted}>
+                    MODE
+                  </Text>
+                  <Box flexDirection="row" gap="sm" flexWrap="wrap">
+                    {w.modes.map((m) => (
+                      <Button
+                        key={`mode-${w.id}-${m}`}
+                        variant={m === w.mode ? 'primary' : undefined}
+                        label={m === 'default' ? 'default (watch)' : m}
+                        onPress={() => {
+                          const restarts = w.services.filter((r) => LIVE.includes(r.status) && r.mode !== m && (r.modes.includes(m) || m === 'default')).map((r) => r.name)
+                          return propose($, { title: `Switch to mode ${m}?`, detail: restarts.length ? `Restarts ${restarts.length} running service(s)${m !== 'default' ? ', running the mode’s tasks (e.g. build) first — can take minutes' : ''}: ${listed(restarts)}.` : 'No running service is affected.', label: restarts.length ? `Switch & restart ${restarts.length}` : 'Switch', danger: restarts.length > 0, method: 'POST', path: `/api/workspaces/${w.id}/mode`, body: { mode: m, restart: true }, busy: `Switching to ${m}` })
+                        }}
+                      />
+                    ))}
+                  </Box>
+                </Box>
+              )}
+              {menuOpen && w.tasks.length + w.serviceTasks.length > 0 && (
+                <Box flexDirection="column" gap="xs">
+                  <Text size="footnote" weight="semibold" color={C.muted}>
+                    TASKS
+                  </Text>
+                  <Box flexDirection="row" gap="sm" flexWrap="wrap">
+                    {w.tasks.map((t) => (
+                      <Button key={`task-${w.id}-${t}`} label={`▷ ${t}`} onPress={() => propose($, { title: `Run task ${t}?`, detail: 'Runs the workspace task; output goes to the workspace task log (devpilot task, dashboard).', label: `Run ${t}`, danger: false, method: 'POST', path: `/api/workspaces/${w.id}/tasks`, body: { task: t }, busy: `Running ${t}` })} />
+                    ))}
+                    {w.serviceTasks
+                      .filter((t) => !w.tasks.includes(t))
+                      .map((t) => (
+                        <Button key={`stask-${w.id}-${t}`} label={`▷ ${t} · all`} onPress={() => {
+                          const svcs = w.services.filter((r) => r.tasks.includes(t)).map((r) => r.name)
+                          return propose($, { title: `Run ${t} in ${svcs.length} services?`, detail: `One after another: ${listed(svcs)}. Services whose task stops them restart after.`, label: `Run ${t}`, danger: false, method: 'POST', path: `/api/workspaces/${w.id}/tasks`, body: { task: t, all: true }, busy: `Running ${t} in every service` })
+                        }} />
+                      ))}
+                  </Box>
+                </Box>
+              )}
+
+              {/* pending confirmation */}
+              {pending && (
+                <Box key="confirm" flexDirection="column" gap="sm" borderStyle="round" borderColor={pending.danger ? C.cardBorder : C.blueRing} backgroundColor={pending.danger ? C.cardBg : C.blueBg} padding="md">
+                  <Text weight="semibold" color={pending.danger ? C.cardTitle : C.blue}>
+                    {pending.title}
+                  </Text>
+                  <Text size="caption" color={pending.danger ? C.cardBody : undefined} dimColor={!pending.danger}>
+                    {pending.detail}
+                  </Text>
+                  <Box flexDirection="row" gap="sm">
+                    <Button key="confirm-ok" variant="primary" label={pending.label} onPress={() => decide($, true)} />
+                    <Button key="confirm-cancel" label="Cancel" onPress={() => decide($, false)} />
+                  </Box>
                 </Box>
               )}
 
@@ -643,7 +758,7 @@ export const register: Register = (on) => {
                       <Button key={`ask-${r.key}`} variant="primary" label="✦  Ask Claude" onPress={() => $.prompt.submit({ text: diagnosePrompt(r), asUser: true })} />
                     </Box>
                     <Button key={`logs-${r.key}`} label="≡  Logs" onPress={() => openDashboard($, `/service/${r.key}/logs`)} />
-                    <Button key={`halt-${r.key}`} label="■" onPress={() => act($, `Stopping ${r.name}`, 'POST', `/api/services/${r.key}/stop`)} />
+                    <Button key={`halt-${r.key}`} label="■" onPress={() => propose($, { title: `Stop ${r.name}?`, detail: 'Stops it and its restart attempts.', label: 'Stop', danger: true, method: 'POST', path: `/api/services/${r.key}/stop`, body: null, busy: `Stopping ${r.name}` })} />
                   </Box>
                 </Box>
               ))}
@@ -671,7 +786,7 @@ export const register: Register = (on) => {
                         {gUp}/{g.rows.length}
                       </Text>
                     </Box>
-                    {g.rows.map(serviceRow)}
+                    {g.rows.map((r) => serviceRow(r, all))}
                   </Box>
                 )
               })}
@@ -688,10 +803,16 @@ export const register: Register = (on) => {
                       </Text>
                     </Box>
                   ) : (
-                    <Button key={`up-${w.id}`} variant="primary" label={'▶︎  Start all'} onPress={() => act($, `Starting ${w.name}`, 'POST', `/api/workspaces/${w.id}/up`, { background: true })} />
+                    <Button key={`up-${w.id}`} variant="primary" label={'▶︎  Start all'} onPress={() => {
+                      const down = w.services.filter((r) => !LIVE.includes(r.status) && !FAILING.includes(r.status)).map((r) => r.name)
+                      return propose($, { title: `Start ${w.name}?`, detail: `Starts the default profile in dependency order; ${down.length} service(s) are not running: ${listed(down)}.`, label: 'Start all', danger: false, method: 'POST', path: `/api/workspaces/${w.id}/up`, body: { background: true }, busy: `Starting ${w.name}` })
+                    }} />
                   )}
                 </Box>
-                {anyActive && <Button key={`down-${w.id}`} label="■  Stop all" onPress={() => act($, `Stopping ${w.name}`, 'POST', `/api/workspaces/${w.id}/down`)} />}
+                {anyActive && <Button key={`down-${w.id}`} label="■  Stop all" onPress={() => {
+                      const up = w.services.filter((r) => LIVE.includes(r.status) || FAILING.includes(r.status) || r.queued).map((r) => r.name)
+                      return propose($, { title: `Stop all of ${w.name}?`, detail: `Stops ${up.length} service(s), dependents first: ${listed(up)}.`, label: 'Stop all', danger: true, method: 'POST', path: `/api/workspaces/${w.id}/down`, body: null, busy: `Stopping ${w.name}` })
+                    }} />}
               </Box>
             </Box>
           )

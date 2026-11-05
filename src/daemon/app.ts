@@ -52,7 +52,7 @@ export function createApp({ sup, token, startedAt, dashboardDir, shutdown }: App
 
   app.post('/api/auth/code', (c) => {
     const code = crypto.randomBytes(16).toString('hex');
-    codes.set(code, Date.now() + 60_000);
+    codes.set(code, Date.now() + 5 * 60_000); // one-time; long enough to paste into another browser
     return c.json({ code });
   });
 
@@ -61,7 +61,8 @@ export function createApp({ sup, token, startedAt, dashboardDir, shutdown }: App
     const exp = codes.get(code);
     codes.delete(code);
     if (!exp || exp < Date.now()) return c.text('Login link expired — run `devpilot open` again.', 401);
-    setCookie(c, 'dp_session', token, { httpOnly: true, sameSite: 'Strict', path: '/' });
+    // Persistent (30 days) so a browser stays logged in across restarts.
+    setCookie(c, 'dp_session', token, { httpOnly: true, sameSite: 'Strict', path: '/', maxAge: 30 * 24 * 3600 });
     const to = c.req.query('to');
     return c.redirect(to && to.startsWith('/') && !to.startsWith('//') ? to : '/');
   });
@@ -124,8 +125,9 @@ export function createApp({ sup, token, startedAt, dashboardDir, shutdown }: App
   });
 
   app.post('/api/workspaces/:ws/up', async (c) => {
-    const { profile, services, wait, background } = await c.req.json().catch(() => ({}));
+    const { profile, services, wait, background, mode } = await c.req.json().catch(() => ({}));
     const id = c.req.param('ws');
+    if (mode) sup.setMode(id, mode);
     if (background && !services?.length) {
       sup.startProfile(id, profile || 'default', { wait: false }).catch(() => undefined);
       return c.json({ ok: true, workspace: id, background: true });
@@ -140,6 +142,61 @@ export function createApp({ sup, token, startedAt, dashboardDir, shutdown }: App
 
   app.post('/api/workspaces/:ws/down', async (c) => c.json(await sup.stopWorkspace(c.req.param('ws'))));
 
+  /** Switch the workspace (or some services) to a mode; optionally restart what is live. */
+  app.post('/api/workspaces/:ws/mode', async (c) => {
+    const { mode, services, restart } = await c.req.json();
+    const id = c.req.param('ws');
+    const r = sup.setMode(id, mode, services);
+    const restarted: string[] = [];
+    if (restart) {
+      for (const key of r.live) {
+        restarted.push(key);
+        void sup.restart(key).catch(() => undefined);
+      }
+    }
+    return c.json({ ok: true, mode, changed: r.changed, needsRestart: restart ? [] : r.live, restarted });
+  });
+
+  app.get('/api/workspaces/:ws/tasks', (c) => c.json(sup.taskInfo(c.req.param('ws'))));
+
+  /** Run a task: `{ task, service? }`, or `{ task, all: true }` for every service that defines it. */
+  app.post('/api/workspaces/:ws/tasks', async (c) => {
+    const { task, service, all, wait } = await c.req.json();
+    const id = c.req.param('ws');
+    if (all) {
+      const info = sup.taskInfo(id);
+      const targets = Object.entries(info.services).filter(([, ts]) => ts.some((t) => t.name === task)).map(([s]) => s);
+      if (!targets.length) return c.json({ error: `no service defines task "${task}"` }, 400);
+      // One after another: parallel installs fight over the same caches.
+      const job = (async () => {
+        const runs = [];
+        for (const s of targets) runs.push(await sup.runTask(id, s, task, { wait: true }));
+        return runs;
+      })();
+      if (wait) return c.json(await job);
+      job.catch(() => undefined);
+      return c.json({ ok: true, services: targets, background: true });
+    }
+    const run = await sup.runTask(id, service, task, { wait: !!wait });
+    const { _done, ...plain } = run as any;
+    void _done;
+    return c.json(plain);
+  });
+
+  app.get('/api/tasks/:id', (c) => {
+    const run = sup.taskRun(c.req.param('id'));
+    if (!run) return c.json({ error: 'not found' }, 404);
+    const { _done, ...plain } = run as any;
+    void _done;
+    return c.json(plain);
+  });
+
+  app.post('/api/tasks/:id/cancel', (c) => {
+    const { _done, ...plain } = sup.cancelTask(c.req.param('id')) as any;
+    void _done;
+    return c.json(plain);
+  });
+
   // ---------------------------------------------------------- services
 
   const key = (c: Context) => `${c.req.param('ws')}/${c.req.param('svc')}`;
@@ -148,6 +205,7 @@ export function createApp({ sup, token, startedAt, dashboardDir, shutdown }: App
 
   app.post('/api/services/:ws/:svc/start', async (c) => {
     const b = await c.req.json().catch(() => ({}));
+    if (b.mode) sup.setMode(c.req.param('ws'), b.mode, [c.req.param('svc')]);
     const job = sup.start(key(c), { deps: b.deps !== false, wait: !!b.wait, timeoutMs: b.timeoutMs });
     if (b.background) {
       job.catch(() => undefined);
@@ -226,6 +284,13 @@ export function createApp({ sup, token, startedAt, dashboardDir, shutdown }: App
     return i ? c.json(i) : c.json({ error: 'not found' }, 404);
   });
 
+  app.post('/api/incidents/:id/resolve', (c) => {
+    const i = sup.incidents.resolveId(c.req.param('id'));
+    if (!i) return c.json({ error: 'not found' }, 404);
+    sup.touch(i.key);
+    return c.json(i);
+  });
+
   // -------------------------------------------------------------- ports
 
   app.get('/api/ports', async (c) => {
@@ -271,14 +336,15 @@ export function createApp({ sup, token, startedAt, dashboardDir, shutdown }: App
 
   app.get('/api/events', (c) => {
     const ws = c.req.query('ws');
-    const kinds = new Set((c.req.query('types') || 'status,incident,metrics,log,workspaces').split(','));
+    const kinds = new Set((c.req.query('types') || 'status,incident,metrics,log,workspaces,task').split(','));
     return streamSSE(c, async (stream) => {
       const queue: DaemonEvent[] = [];
       let wake: (() => void) | undefined;
       const off = sup.on((e) => {
         if (!kinds.has(e.type)) return;
         if (ws) {
-          const k = e.type === 'status' ? e.service.key : e.type === 'incident' ? e.incident.key : e.type === 'workspaces' ? `${ws}/` : e.key;
+          const k =
+            e.type === 'status' ? e.service.key : e.type === 'incident' ? e.incident.key : e.type === 'workspaces' ? `${ws}/` : e.type === 'task' ? `${e.run.workspace}/` : e.key;
           if (!k.startsWith(`${ws}/`)) return;
         }
         if (queue.length > 5000) queue.shift();

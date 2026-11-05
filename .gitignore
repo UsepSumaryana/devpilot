@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.devpilot-test/
+evals/results/
+.claude-plugin/types/
+plugins/devpilot-panel/.claude-plugin/types/

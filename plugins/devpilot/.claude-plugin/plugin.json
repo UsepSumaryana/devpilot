@@ -1,0 +1,9 @@
+{
+  "name": "devpilot",
+  "displayName": "DevPilot",
+  "version": "0.1.0",
+  "description": "Run and monitor local dev services of any runtime (Node, Python, Go, Java, Docker Compose...) with a supervising daemon, a `devpilot` CLI for Claude, crash notifications, and a web dashboard.",
+  "author": { "name": "Usep" },
+  "license": "MIT",
+  "keywords": ["dev-server", "process-manager", "monitoring", "local-development", "docker-compose"]
+}

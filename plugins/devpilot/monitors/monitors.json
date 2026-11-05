@@ -1,0 +1,7 @@
+[
+  {
+    "name": "devpilot-incidents",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/dist/cli.js\" watch --quiet",
+    "description": "DevPilot service incidents (crash, failed start, unhealthy, memory, port conflict, error bursts) and recoveries for this project's services"
+  }
+]

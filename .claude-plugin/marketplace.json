@@ -1,0 +1,19 @@
+{
+  "name": "devpilot",
+  "owner": {
+    "name": "Usep"
+  },
+  "description": "DevPilot: run and monitor local dev services from Claude Code.",
+  "plugins": [
+    {
+      "name": "devpilot",
+      "source": "./plugins/devpilot",
+      "description": "Run and monitor local dev services from Claude Code: daemon, CLI, crash notifications, web dashboard."
+    },
+    {
+      "name": "devpilot-panel",
+      "source": "./plugins/devpilot-panel",
+      "description": "Live DevPilot services pane beside the chat in Claude desktop (and the terminal)."
+    }
+  ]
+}

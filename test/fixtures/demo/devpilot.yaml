@@ -1,0 +1,24 @@
+version: 1
+name: demo
+env: { GREETING: hi }
+env_profiles:
+  loud: { env: { GREETING: HELLO } }
+profiles:
+  default: [api, web, worker]
+  all: [api, web, worker, crasher]
+services:
+  api:
+    run: node api.mjs
+    port: 4510
+    health: { http: /health, interval: 2s }
+  web:
+    run: python -m http.server 4511 --bind 127.0.0.1
+    port: 4511
+    depends_on: [api]
+  worker:
+    run: node worker.mjs
+    ready: { log: "worker ready" }
+    depends_on: [api]
+  crasher:
+    run: node crasher.mjs
+    restart: { policy: on-failure, max: 2, delay: 500ms }

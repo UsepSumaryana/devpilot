@@ -361,16 +361,23 @@ const ALERT_ICON = svg(
 
 const DIVIDER = `<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1" viewBox="0 0 1000 1" preserveAspectRatio="none"><rect width="1000" height="1" fill="${C.border}"/></svg>`
 
-function barSvg(services: Row[]): string {
+/**
+ * Segmented health bar, drawn at (about) the pane's real pixel width so the
+ * stretch to the slot is ~1:1 and the 3px corners stay round. A fixed narrow
+ * viewBox stretched across the pane turned 2 segments into flat lozenges.
+ */
+function barSvg(services: Row[], widthPx: number): string {
   const n = Math.max(1, services.length)
-  const seg = 30
-  const gap = 3
-  const w = n * seg + (n - 1) * gap
+  const w = Math.max(120, Math.round(widthPx))
+  const gap = n > 1 ? Math.max(3, Math.min(6, w / n / 8)) : 0
+  const seg = (w - gap * (n - 1)) / n
   const fill = (r: Row) => {
     const k = kindOf(r)
     return k === 'running' ? C.green : k === 'starting' ? C.blueBar : k === 'failing' ? C.red : C.bar
   }
-  const rects = services.map((r, i) => `<rect x="${i * (seg + gap)}" y="0" width="${seg}" height="6" rx="3" fill="${fill(r)}"/>`).join('')
+  const rects = services
+    .map((r, i) => `<rect x="${(i * (seg + gap)).toFixed(1)}" y="0" width="${seg.toFixed(1)}" height="6" rx="3" ry="3" fill="${fill(r)}"/>`)
+    .join('')
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="6" viewBox="0 0 ${w} 6" preserveAspectRatio="none">${rects}</svg>`
 }
 
@@ -591,7 +598,7 @@ export const register: Register = (on) => {
                   </Text>
                 </Box>
                 {Svg ? (
-                  <Svg source={barSvg(all)} alt={`${up} of ${all.length} services up`} height={6} />
+                  <Svg source={barSvg(all, ((e.props.bodyColumns ?? 44) - 2) * 8.6)} alt={`${up} of ${all.length} services up`} height={6} />
                 ) : (
                   <Text>
                     {all.map((r) => {
@@ -676,8 +683,8 @@ export const register: Register = (on) => {
                   {starting + queued > 0 ? (
                     <Box borderStyle="round" borderColor={C.btnBorder} backgroundColor="#F7F6F3" paddingX="sm" paddingY="xs" flexDirection="row" gap="xs" alignItems="center" justifyContent="center">
                       {pic(SPIN(C.muted), 'working', '◌', C.muted, 12, 12)}
-                      <Text color={C.muted}>
-                        Starting {up + starting} of {all.length}…
+                      <Text color={C.muted} wrap="truncate-end">
+                        Starting {up + starting}/{all.length}…
                       </Text>
                     </Box>
                   ) : (

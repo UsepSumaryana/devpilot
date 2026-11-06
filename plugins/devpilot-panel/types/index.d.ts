@@ -65,6 +65,7 @@ declare module 'claude-code' {
       busy: Shaped<string | null>;
       menu: Shaped<boolean>;
       confirm: Shaped<Confirm | null>;
+      paneOpen: Shaped<boolean>;
     };
   }
 }

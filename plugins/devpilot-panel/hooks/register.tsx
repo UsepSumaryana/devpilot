@@ -15,6 +15,8 @@ const scope = atom({ plugin: 'devpilot-panel', key: 'scope' } as const, 'project
 const busy = atom({ plugin: 'devpilot-panel', key: 'busy' } as const, null as string | null, { shape: 'busy-1' })
 const menu = atom({ plugin: 'devpilot-panel', key: 'menu' } as const, false, { shape: 'menu-1' })
 const confirm = atom({ plugin: 'devpilot-panel', key: 'confirm' } as const, null as Confirm | null, { shape: 'confirm-1' })
+// Whether the pane is up in this session (drives the band above the prompt).
+const paneOpen = atom({ plugin: 'devpilot-panel', key: 'paneOpen' } as const, false, { shape: 'pane-open-1' })
 
 type Daemon = { port: number; token: string }
 
@@ -99,6 +101,8 @@ function toWs(w: any): Ws {
 // Module state: starts over when the module reloads, which is fine.
 let cwd = ''
 let projectWs: string | null = null
+/** The session folder (or a parent) has a devpilot.yaml: only then do the pane and band show up. */
+let isProject = false
 let resolvedOnce = false
 const seen = new Set<string>()
 let seeded = false
@@ -235,9 +239,50 @@ async function openDashboard($: EngineInterface, route = '') {
   await openUrl($, `http://127.0.0.1:${d.port}/auth?code=${code}&to=${to}`)
 }
 
+const CONFIG_FILES = ['devpilot.yaml', 'devpilot.yml', '.devpilot.yaml']
+
+async function hasConfig($: EngineInterface, dir: string): Promise<boolean> {
+  let d = dir.replace(/\\/g, '/').replace(/\/+$/, '')
+  for (let i = 0; i < 40 && d; i++) {
+    for (const f of CONFIG_FILES) {
+      try {
+        await $.fs.read(`${d}/${f}`)
+        return true
+      } catch {
+        /* not here */
+      }
+    }
+    const up = d.replace(/\/[^/]*$/, '')
+    if (!up || up === d || /^[A-Za-z]:$/.test(d)) break
+    d = up
+  }
+  return false
+}
+
+/** The person's last choice, remembered across sessions: open or not. */
+async function rememberOpen($: EngineInterface, open: boolean) {
+  await update($, paneOpen, (): boolean => open)
+  try {
+    await $.store.set('paneOpen', open)
+  } catch {
+    /* the preference is a convenience */
+  }
+}
+
 async function openPane($: EngineInterface) {
   await $.ui.open({ id: PANE, title: 'Services' })
+  await rememberOpen($, true)
   await poll($)
+}
+
+async function togglePane($: EngineInterface): Promise<boolean> {
+  const isUp = (await $.ui.panes()).some((p) => p.id === PANE)
+  if (isUp) {
+    await $.ui.close({ id: PANE }) // the ui.close hook records the choice
+    return false
+  }
+  await openPane($)
+  return true
 }
 
 // ---------------------------------------------------------------- layout model
@@ -442,14 +487,26 @@ export const register: Register = (on) => {
     } catch {
       /* the pane still works without a project scope */
     }
-    // Open the pane and start polling before anything that can be refused.
-    void $.ui.open({ id: PANE, title: 'Services' })
+    isProject = cwd ? await hasConfig($, cwd) : false
+    // Reopen only if the person left it open last time, and only in a DevPilot project.
+    let wantOpen = false
+    try {
+      wantOpen = (await $.store.get('paneOpen')) === true
+    } catch {
+      /* no preference yet */
+    }
+    if (isProject && wantOpen) {
+      void $.ui.open({ id: PANE, title: 'Services' })
+      await update($, paneOpen, (): boolean => true)
+    } else {
+      await update($, paneOpen, (): boolean => false)
+    }
     $.clock.every(2000, () => tick($))
     tick($)
     // Each name on its own: one refused name (a built-in's) must not cost the others.
     for (const name of ['devpilot-panel', 'services', 'dp-services']) {
       try {
-        await $.command.register({ name, description: 'Show the DevPilot services pane' })
+        await $.command.register({ name, description: 'Show or hide the DevPilot services pane' })
       } catch {
         /* name taken by a built-in */
       }
@@ -457,19 +514,39 @@ export const register: Register = (on) => {
     return result
   })
 
-  on('command.run', { command: 'services' }, async ($) => {
-    await openPane($)
-    return { text: 'Services pane opened.' }
+  on('command.run', { command: 'services' }, async ($) => ({ text: (await togglePane($)) ? 'Services pane opened.' : 'Services pane hidden.' }))
+
+  on('command.run', { command: 'dp-services' }, async ($) => ({ text: (await togglePane($)) ? 'Services pane opened.' : 'Services pane hidden.' }))
+
+  on('command.run', { command: 'devpilot-panel' }, async ($) => ({ text: (await togglePane($)) ? 'Services pane opened.' : 'Services pane hidden.' }))
+
+  // The person closed it (its X, a key, or our toggle): remember that for the next sessions.
+  // A close on unload (a plugin reload) is not their choice and changes nothing.
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    const result = await next(e)
+    if (e.origin.kind !== 'unload') await rememberOpen($, false)
+    return result
   })
 
-  on('command.run', { command: 'dp-services' }, async ($) => {
-    await openPane($)
-    return { text: 'Services pane opened.' }
-  })
-
-  on('command.run', { command: 'devpilot-panel' }, async ($) => {
-    await openPane($)
-    return { text: 'Services pane opened.' }
+  // While the pane is hidden, a one-line summary above the prompt opens it again.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!isProject || e.props.hasSurvey || (await read($, paneOpen))) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const snap = await read($, snapshot)
+    const ws = snap.workspaces.find((w) => w.id === snap.projectWs)
+    const up = ws ? ws.services.filter((r) => r.status === 'running').length : 0
+    const bad = ws ? ws.services.filter((r) => FAILING.includes(r.status)).length : 0
+    const label = snap.daemon !== 'up' ? 'daemon off' : ws ? `${up}/${ws.services.length} up${bad ? ` · ${bad} failing` : ''}` : 'not registered yet'
+    return (
+      <Box flexDirection="row" gap="sm" alignItems="center">
+        <Text color={snap.daemon !== 'up' ? 'inactive' : bad ? 'error' : up ? 'success' : 'inactive'}>●</Text>
+        <Text dimColor>DevPilot{ws ? ` · ${ws.name}` : ''}</Text>
+        <Text color={bad ? 'error' : undefined} dimColor={!bad}>
+          {label}
+        </Text>
+        <Button key="show-pane" plain dimColor label="Show services ▸" onPress={() => openPane($)} />
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

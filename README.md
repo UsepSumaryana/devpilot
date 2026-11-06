@@ -103,8 +103,12 @@ Atau minta Claude: *"set up devpilot untuk project ini lalu jalankan"*.
 
 ## Panel Services (Claude desktop)
 
-Panel terbuka sendiri saat sesi dimulai. Kalau ditutup, buka lagi dengan **`/devpilot-panel`**
-(atau `/dp-services`, atau `/services` bila namanya tidak bentrok dengan perintah bawaan). Isinya:
+Panel hanya muncul di proyek yang punya `devpilot.yaml`, dan mengingat pilihan terakhir: kalau
+terakhir ditutup, sesi baru tidak membukanya; kalau terakhir dibiarkan terbuka, sesi baru membukanya lagi.
+Selama panel tersembunyi, sebaris ringkasan di atas prompt (`DevPilot · <workspace> · 3/5 up`) punya
+tombol **Show services ▸**. **`/devpilot-panel`** (atau `/dp-services`, atau `/services` bila namanya
+tidak bentrok dengan perintah bawaan) membuka atau menyembunyikan panel. Letak panel ditentukan
+aplikasi desktop; mod tidak bisa memindahkannya ke rail sesi. Isinya:
 
 - **Header**: nama workspace, status aksi yang sedang berjalan, ⊞ untuk dashboard, ⋯ untuk menu
   (semua proyek, rangkum incident lewat Claude, clear incident).

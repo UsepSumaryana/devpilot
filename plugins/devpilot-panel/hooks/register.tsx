@@ -4,7 +4,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Confirm, Row, Scope, Snapshot, Ws } from '../types'
+import type { Changed, Confirm, Row, Scope, Snapshot, Ws } from '../types'
 
 const PANE = 'devpilot'
 const EMPTY: Snapshot = { daemon: 'unknown', detail: null, projectWs: null, workspaces: [], openIncidents: 0, updatedAt: 0 }
@@ -17,6 +17,9 @@ const menu = atom({ plugin: 'devpilot-panel', key: 'menu' } as const, false, { s
 const confirm = atom({ plugin: 'devpilot-panel', key: 'confirm' } as const, null as Confirm | null, { shape: 'confirm-1' })
 // Whether the pane is up in this session (drives the band above the prompt).
 const paneOpen = atom({ plugin: 'devpilot-panel', key: 'paneOpen' } as const, false, { shape: 'pane-open-1' })
+// Running services whose code Claude edited since they started, and the band's "restart them?" step.
+const changed = atom({ plugin: 'devpilot-panel', key: 'changed' } as const, [] as Changed[], { shape: 'changed-1' })
+const restartAsk = atom({ plugin: 'devpilot-panel', key: 'restartAsk' } as const, false, { shape: 'restart-ask-1' })
 
 type Daemon = { port: number; token: string }
 
@@ -81,6 +84,10 @@ function toRow(s: any): Row {
     modes: Array.isArray(s.modes) ? s.modes : ['default'],
     task: typeof s.task === 'string' ? s.task : null,
     tasks: Array.isArray(s.tasks) ? s.tasks : [],
+    cwd: typeof s.cwd === 'string' ? s.cwd : '',
+    run: typeof s.run === 'string' ? s.run : '',
+    runs: Array.isArray(s.runs) ? s.runs : typeof s.run === 'string' ? [s.run] : [],
+    startedAt: typeof s.startedAt === 'number' ? s.startedAt : null,
   }
 }
 
@@ -106,12 +113,18 @@ let isProject = false
 let resolvedOnce = false
 const seen = new Set<string>()
 let seeded = false
-let polling = false
+/** The poll under way, shared: a caller that needs fresh data waits for it instead of skipping. */
+let inflight: Promise<void> | null = null
 
-async function poll($: EngineInterface) {
-  if (polling) return
-  polling = true
-  try {
+function poll($: EngineInterface): Promise<void> {
+  inflight ??= pollOnce($).finally(() => {
+    inflight = null
+  })
+  return inflight
+}
+
+async function pollOnce($: EngineInterface) {
+  {
     const d = await daemonInfo($)
     if (!d) {
       await update($, snapshot, (s): Snapshot => ({ ...s, daemon: 'down', detail: 'not running', workspaces: [], openIncidents: 0, updatedAt: Date.now() }))
@@ -138,6 +151,19 @@ async function poll($: EngineInterface) {
     if (projectWs === null && workspaces.length && resolvedOnce) resolvedOnce = false // registered later? look again
     await update($, snapshot, (): Snapshot => ({ daemon: 'up', detail: null, projectWs, workspaces, openIncidents: (sum.incidents || []).length, updatedAt: Date.now() }))
 
+    const all = workspaces.flatMap((w) => w.services)
+    const pendingChanges = await read($, changed)
+    if (pendingChanges.length) {
+      const still = pendingChanges.filter((c) => {
+        const r = all.find((x) => x.key === c.key)
+        return !!r && LIVE.includes(r.status) && (r.startedAt ?? 0) <= c.at
+      })
+      if (still.length !== pendingChanges.length) {
+        await update($, changed, (): Changed[] => still)
+        if (!still.length) await update($, restartAsk, (): boolean => false)
+      }
+    }
+
     const mine = workspaces.find((w) => w.id === projectWs)
     const rows = (mine ? [mine] : workspaces).flatMap((w) => w.services)
     const up = rows.filter((r) => r.status === 'running').length
@@ -154,8 +180,6 @@ async function poll($: EngineInterface) {
       if (i.severity === 'error' && i.kind !== 'error-log') void $.ui.notify(text, { title: 'DevPilot' })
     }
     seeded = true
-  } finally {
-    polling = false
   }
 }
 
@@ -477,6 +501,121 @@ const diagnosePrompt = (r: Row) =>
 const triagePrompt = (w: Ws) =>
   `Summarise the open DevPilot incidents of workspace ${w.id} (\`devpilot incidents --open --ws ${w.id} --json\`), most important first, and say which need action. Don't change anything.`
 
+// ------------------------------------------------- guard and code changes
+// Claude starting a managed service itself (`yarn start:dev` in its folder) blocks the turn and
+// races DevPilot for the port; an edit to a service without a watcher leaves it on old code.
+
+const slash = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
+const isWin = (p: string) => /^[A-Za-z]:/.test(p)
+/** Same folder, or inside it. Case-insensitive on Windows paths. */
+function within(path: string, dir: string): boolean {
+  if (!path || !dir) return false
+  let f = slash(path)
+  let d = slash(dir)
+  if (isWin(d)) {
+    f = f.toLowerCase()
+    d = d.toLowerCase()
+  }
+  return f === d || f.startsWith(d + '/')
+}
+
+/** Resolves `p` (absolute, relative, or Git Bash's `/d/x`) against `base`. */
+function resolveDir(base: string, p: string): string {
+  const raw = p.replace(/^["']|["']$/g, '')
+  const gitBash = isWin(base) ? /^\/([a-zA-Z])(\/.*)?$/.exec(raw) : null
+  const full = gitBash ? `${gitBash[1]!.toUpperCase()}:${gitBash[2] ?? '/'}` : /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith('/') ? raw : `${base}/${raw}`
+  const out: string[] = []
+  for (const seg of slash(full).split('/')) {
+    if (seg === '..') out.pop()
+    else if (seg !== '.' && seg !== '') out.push(seg)
+  }
+  return (slash(full).startsWith('/') ? '/' : '') + out.join('/')
+}
+
+/** One shell command made comparable: env prefixes dropped, `npm run x` / `yarn x` / `pnpm x` / `bun run x` read as `script x`, a `--prefix`/`--cwd` folder pulled out. */
+function canon(cmd: string): { text: string; dir: string | null } {
+  let c = cmd.trim().replace(/\s+/g, ' ')
+  c = c.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S* )+/, '')
+  let dir: string | null = null
+  c = c.replace(/ (?:--prefix|--cwd|-C|--dir)[ =](\S+)/, (_m: string, d: string) => {
+    dir = d
+    return ''
+  })
+  const m = /^(npm|pnpm|bun|yarn)(?: run(?:-script)?)? ([\w:.@/-]+)(.*)$/.exec(c)
+  if (m && !(m[1] === 'npm' && /^(?:i|install|ci|exec|x)$/.test(m[2]!))) c = `script ${m[2]}${m[3]!.replace(/^ --(?= |$)/, '')}`
+  return { text: c.trim(), dir }
+}
+
+type Hit = { row: Row; command: string }
+
+/** The managed service a Bash command would start, if any: its command, run in its folder. */
+function managedStart(command: string, base: string, rows: Row[]): Hit | null {
+  let dir = base
+  for (const part of command.split(/&&|\|\||;|\||\n/)) {
+    const seg = part.trim().replace(/&$/, '').trim()
+    if (!seg) continue
+    const cd = /^(?:cd|pushd|Set-Location|sl)(?: -[A-Za-z]+)* +(.+)$/.exec(seg)
+    if (cd) {
+      dir = resolveDir(dir, cd[1]!.trim())
+      continue
+    }
+    const want = canon(seg)
+    const where = want.dir ? resolveDir(dir, want.dir) : dir
+    for (const row of rows) {
+      if (!row.cwd || !within(where, row.cwd) || !within(row.cwd, where)) continue
+      for (const run of row.runs) {
+        const have = canon(run).text
+        if (have && (want.text === have || want.text.startsWith(have + ' '))) return { row, command: run }
+      }
+    }
+  }
+  return null
+}
+
+function guardText(h: Hit, wsName: string): string {
+  const { row } = h
+  const port = row.port ? `, port ${row.port}` : ''
+  if (LIVE.includes(row.status))
+    return `DevPilot already runs "${row.name}" (${row.key}${port}, ${row.status}) with this command. Running it again here would block this turn and clash with the running one. Use \`devpilot logs ${row.key} --json\` to read its output, or \`devpilot restart ${row.key} --wait --json\` to restart it.`
+  return `"${row.name}" is managed by DevPilot (workspace ${wsName}). Start it in the background with \`devpilot start ${row.key} --wait --json\` (dependencies and mode included), then read its output with \`devpilot logs ${row.key} --json\`. Running it here would block this turn and DevPilot would not supervise it.`
+}
+
+const EDIT_TOOLS = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit']
+/** A command that reloads by itself: no restart needed after an edit. */
+const WATCHES = /--watch\b|\bwatch\b|\bnodemon\b|\bvite\b(?! (?:build|preview))|\b(?:next|nuxt|astro|remix) dev\b|(?:^|[\s:])dev\b|--reload\b|ts-node-dev|\bair\b|webpack(?:-dev-server| serve)|--hot\b/
+/** Files whose change a running service does not care about. */
+const NOT_CODE = /(?:^|\/)(?:node_modules|dist|build|out|coverage|logs?|\.git|\.devpilot)\/|\.(?:md|mdx|txt|log)$/i
+
+async function noteEdit($: EngineInterface, file: string) {
+  if (!file || NOT_CODE.test(slash(file))) return
+  const snap = await read($, snapshot)
+  if (snap.daemon !== 'up') return
+  const hit = snap.workspaces
+    .flatMap((w) => w.services)
+    .filter((r) => LIVE.includes(r.status) && r.cwd && within(file, r.cwd) && !WATCHES.test(r.run))
+  if (!hit.length) return
+  const at = Date.now()
+  const name = slash(file).split('/').pop() || file
+  await update($, changed, (list): Changed[] => {
+    const out = list.map((c) => ({ ...c, files: [...c.files] }))
+    for (const r of hit) {
+      const have = out.find((c) => c.key === r.key)
+      if (have) {
+        if (!have.files.includes(name)) have.files = [...have.files, name].slice(-20)
+        have.at = at
+      } else out.push({ key: r.key, name: r.name, files: [name], at })
+    }
+    return out
+  })
+}
+
+async function restartChanged($: EngineInterface) {
+  const list = await read($, changed)
+  await update($, restartAsk, (): boolean => false)
+  await update($, changed, (): Changed[] => [])
+  for (const c of list) await act($, `Restarting ${c.name}`, 'POST', `/api/services/${c.key}/restart`, { background: true })
+}
+
 // ------------------------------------------------------------------ hooks
 
 export const register: Register = (on) => {
@@ -530,23 +669,72 @@ export const register: Register = (on) => {
 
   // While the pane is hidden, a one-line summary above the prompt opens it again.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!isProject || e.props.hasSurvey || (await read($, paneOpen))) return next(e)
+    if (e.props.hasSurvey) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
+    const edits = await read($, changed)
+    const asking = await read($, restartAsk)
+    const showSummary = isProject && !(await read($, paneOpen))
+    if (!edits.length && !showSummary) return next(e)
+    const names = listed(edits.map((c) => c.name), 3)
+    const files = [...new Set(edits.flatMap((c) => c.files))]
+    const many = edits.length > 1
+    const changeRow = !edits.length ? null : asking ? (
+      <Box key="changed" flexDirection="row" gap="sm" alignItems="center">
+        <Text color="warning">↻</Text>
+        <Text>{`Restart ${names}? ${many ? 'They stop and start' : 'It stops and starts'} again.`}</Text>
+        <Button key="restart-changed-ok" variant="primary" label="Restart" onPress={() => restartChanged($)} />
+        <Button key="restart-changed-cancel" plain dimColor label="Cancel" onPress={() => update($, restartAsk, (): boolean => false)} />
+      </Box>
+    ) : (
+      <Box key="changed" flexDirection="row" gap="sm" alignItems="center">
+        <Text color="warning">↻</Text>
+        <Text>{`${names}: code changed since ${many ? 'they' : 'it'} started`}</Text>
+        <Text dimColor>{listed(files, 2)}</Text>
+        <Button key="restart-changed" plain label="Restart ▸" onPress={() => update($, restartAsk, (): boolean => true)} />
+        <Button key="dismiss-changed" plain dimColor label="Dismiss" onPress={() => update($, changed, (): Changed[] => [])} />
+      </Box>
+    )
+    if (!showSummary) return <Box flexDirection="column">{changeRow}</Box>
     const snap = await read($, snapshot)
     const ws = snap.workspaces.find((w) => w.id === snap.projectWs)
     const up = ws ? ws.services.filter((r) => r.status === 'running').length : 0
     const bad = ws ? ws.services.filter((r) => FAILING.includes(r.status)).length : 0
     const label = snap.daemon !== 'up' ? 'daemon off' : ws ? `${up}/${ws.services.length} up${bad ? ` · ${bad} failing` : ''}` : 'not registered yet'
     return (
-      <Box flexDirection="row" gap="sm" alignItems="center">
+      <Box flexDirection="column">
+        {changeRow}
+        <Box key="summary" flexDirection="row" gap="sm" alignItems="center">
         <Text color={snap.daemon !== 'up' ? 'inactive' : bad ? 'error' : up ? 'success' : 'inactive'}>●</Text>
         <Text dimColor>DevPilot{ws ? ` · ${ws.name}` : ''}</Text>
         <Text color={bad ? 'error' : undefined} dimColor={!bad}>
           {label}
         </Text>
         <Button key="show-pane" plain dimColor label="Show services ▸" onPress={() => openPane($)} />
+        </Box>
       </Box>
     )
+  })
+
+  // Claude starting a service DevPilot manages: refuse, and say how to do it through DevPilot.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    if ((await read($, snapshot)).daemon === 'unknown') await pollOnce($).catch(() => undefined) // no poll has finished yet
+    const snap = await read($, snapshot)
+    if (snap.daemon !== 'up' || typeof e.command !== 'string') return next(e)
+    const hit = managedStart(e.command, cwd || (await $.session.cwd()), snap.workspaces.flatMap((w) => w.services))
+    if (!hit) return next(e)
+    const ws = snap.workspaces.find((w) => w.services.some((r) => r.key === hit.row.key))
+    $.ui.toast(`DevPilot: kept Claude from starting ${hit.row.name} outside DevPilot`, { timeoutMs: 6000 })
+    return { deny: guardText(hit, ws?.name ?? hit.row.key.split('/')[0]!) }
+  })
+
+  // Claude edited a file of a running service that does not reload by itself: offer a restart.
+  on('tool.call', async ($, e, next) => {
+    const ran = await next(e)
+    if (!EDIT_TOOLS.includes(e.tool) || ran.deny !== undefined || ran.isError) return ran
+    const input = e as unknown as { file_path?: unknown; notebook_path?: unknown }
+    const file = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : ''
+    if (file) await noteEdit($, resolveDir(cwd, file)).catch(() => undefined)
+    return ran
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

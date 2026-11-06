@@ -23,9 +23,9 @@ const SUMMARY = {
       serviceTasks: ['install'],
       runningTasks: [],
       services: [
-        { key: 'demo-abc123/api', name: 'api', status: 'running', mode: 'build', modes: ['default', 'build'], tasks: ['install'], port: 4510, url: 'http://localhost:4510', health: { state: 'ok', latencyMs: 2 }, cpu: 0.5, mem: 64 * 1048576, restarts: 0, openIncidents: 0 },
+        { key: 'demo-abc123/api', name: 'api', status: 'running', cwd: 'D:\\work\\demo\\backend', run: 'node dist/main.js', runs: ['yarn start:dev', 'node dist/main.js'], startedAt: 1000, mode: 'build', modes: ['default', 'build'], tasks: ['install'], port: 4510, url: 'http://localhost:4510', health: { state: 'ok', latencyMs: 2 }, cpu: 0.5, mem: 64 * 1048576, restarts: 0, openIncidents: 0 },
         { key: 'demo-abc123/worker', name: 'worker', status: 'crashed', health: { state: 'none' }, restarts: 2, exitCode: 1, lastError: 'Error: boom', openIncidents: 1 },
-        { key: 'demo-abc123/web', name: 'web', status: 'stopped', queued: true, dependsOn: ['api'], health: { state: 'none' }, restarts: 0, openIncidents: 0 },
+        { key: 'demo-abc123/web', name: 'web', status: 'stopped', cwd: 'D:/work/demo/web', run: 'npm run dev', runs: ['npm run dev'], queued: true, dependsOn: ['api'], health: { state: 'none' }, restarts: 0, openIncidents: 0 },
       ],
     },
   ],
@@ -64,6 +64,9 @@ function engine(on: any, { daemonUp, project = true, pref }: { daemonUp: boolean
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('session.cwd', () => ({ value: 'D:/work/demo' }))
   on('clock.every', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  // The tool itself, beneath the plugin: it ran.
+  on('tool.call', () => ({ result: {} }))
   on('env.get', (_: any, e: any) => ({ value: e.name === 'USERPROFILE' ? 'C:/Users/me' : undefined }))
   on('fs.read', (_: any, e: any) => {
     const path = String(e.path).replace(/\\/g, '/')
@@ -210,3 +213,81 @@ test('/services toggles the pane', async ($, on) => {
   expect(String((second as any).text)).toMatch(/hidden/)
 })
 
+
+const BAND_ON = (surface: 'desktop' | 'terminal') => ({ plugin: 'devpilot-panel', component: 'AbovePrompt', props: { hasSurvey: false }, surface }) as const
+
+test('Claude starting a running managed service by hand is refused, with the DevPilot command', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  const r: any = await $.tool.call({ tool: 'Bash', command: 'cd backend && yarn start:dev' })
+  expect(String(r.deny ?? r.text)).toMatch(/already runs "api"/)
+  expect(String(r.deny ?? r.text)).toMatch(/devpilot restart demo-abc123\/api/)
+  // Same script through another package manager, from the project root with --prefix.
+  const r2: any = await $.tool.call({ tool: 'Bash', command: 'npm --prefix backend run start:dev' })
+  expect(String(r2.deny ?? r2.text)).toMatch(/already runs "api"/)
+})
+
+test('a stopped managed service: refused, pointing at devpilot start', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  const r: any = await $.tool.call({ tool: 'Bash', command: 'cd /d/work/demo/web; yarn dev' })
+  expect(String(r.deny ?? r.text)).toMatch(/devpilot start demo-abc123\/web --wait --json/)
+})
+
+test('other commands, and the same script in another folder, run as usual', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  for (const command of ['cd backend && yarn build', 'cd backend && yarn test', 'yarn start:dev', 'cd other && npm run dev', 'git status']) {
+    const r: any = await $.tool.call({ tool: 'Bash', command })
+    expect(r.deny ?? (r.isError ? r.text : undefined)).toBeUndefined()
+  }
+})
+
+test('the daemon down: the guard stands aside', async ($, on) => {
+  engine(on, { daemonUp: false })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  const r: any = await $.tool.call({ tool: 'Bash', command: 'cd backend && yarn start:dev' })
+  expect(r.deny ?? (r.isError ? r.text : undefined)).toBeUndefined()
+})
+
+test('an edit to a running service without a watcher offers a restart, asked first', async ($, on) => {
+  engine(on, { daemonUp: true, pref: true }) // pane open: the band shows only the change
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const quiet = await $.ui.mount(BAND_ON(surface))
+    expect(await quiet.find({ type: 'Button', key: 'restart-changed' })).toBeFalsy()
+    await quiet.unmount()
+  }
+  await $.tool.call({ tool: 'Edit', file_path: 'D:\\work\\demo\\backend\\src\\app.service.ts', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Edit', file_path: 'D:/work/demo/backend/README.md', old_string: 'a', new_string: 'b' })
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const band = await $.ui.mount(BAND_ON(surface))
+    expect(await band.find({ type: 'Text', text: /api: code changed since it started/ })).toBeTruthy()
+    expect(await band.find({ type: 'Text', text: /^app\.service\.ts$/ })).toBeTruthy()
+    await band.unmount()
+  }
+  const band = await $.ui.mount(BAND_ON('desktop'))
+  posts.length = 0
+  await band.press({ key: 'restart-changed' })
+  expect(posts).toHaveLength(0) // asked first
+  expect(await band.find({ type: 'Text', text: /Restart api\?/ })).toBeTruthy()
+  await band.press({ key: 'restart-changed-ok' })
+  expect(posts).toEqual(['/api/services/demo-abc123/api/restart'])
+  expect(await band.find({ type: 'Button', key: 'restart-changed' })).toBeFalsy()
+  await band.unmount()
+})
+
+test('edits outside a running service, or to a stopped one, change nothing; Dismiss clears', async ($, on) => {
+  engine(on, { daemonUp: true, pref: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Write', file_path: 'D:/work/demo/web/src/main.ts', content: 'x' })
+  await $.tool.call({ tool: 'Edit', file_path: 'D:/work/demo/docs/x.ts', old_string: 'a', new_string: 'b' })
+  const band = await $.ui.mount(BAND_ON('desktop'))
+  expect(await band.find({ type: 'Button', key: 'restart-changed' })).toBeFalsy()
+  await band.unmount()
+  await $.tool.call({ tool: 'Write', file_path: 'D:/work/demo/backend/src/a.ts', content: 'x' })
+  const again = await $.ui.mount(BAND_ON('desktop'))
+  await again.press({ key: 'dismiss-changed' })
+  expect(await again.find({ type: 'Button', key: 'restart-changed' })).toBeFalsy()
+  await again.unmount()
+})

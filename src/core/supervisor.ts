@@ -375,6 +375,7 @@ export class Supervisor {
       name: rt.spec.name,
       status: rt.status,
       run: rt.spec.run,
+      runs: [...new Set([rt.base.run, ...Object.values(rt.base.modes).map((m) => m.run ?? rt.base.run)])],
       cwd: rt.spec.cwd,
       port: rt.spec.port,
       url: rt.spec.url,

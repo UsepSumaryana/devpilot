@@ -20,7 +20,14 @@ export type Row = {
   modes: string[];
   task: string | null; // running one-shot task, if any
   tasks: string[]; // task names it defines
+  cwd: string;
+  run: string; // the command of its current mode
+  runs: string[]; // its commands across every mode
+  startedAt: number | null;
 };
+
+/** A running service whose source changed (Claude edited it) since it started. */
+export type Changed = { key: string; name: string; files: string[]; at: number };
 
 export type Ws = {
   id: string;
@@ -66,6 +73,8 @@ declare module 'claude-code' {
       menu: Shaped<boolean>;
       confirm: Shaped<Confirm | null>;
       paneOpen: Shaped<boolean>;
+      changed: Shaped<Changed[]>;
+      restartAsk: Shaped<boolean>;
     };
   }
 }

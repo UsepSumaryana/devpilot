@@ -121,6 +121,19 @@ aplikasi desktop; mod tidak bisa memindahkannya ke rail sesi. Isinya:
 
 Setelah memperbarui plugin, jalankan `/reload-plugins`.
 
+### Penjaga untuk Claude
+
+- **Claude tidak menjalankan service sendiri.** Kalau Claude mencoba menjalankan perintah service yang
+  dikelola DevPilot di foldernya (misalnya `cd backend && yarn start:dev`, juga lewat `npm run`, `pnpm`,
+  `bun run` atau `--prefix`), panel menolaknya dan memberi tahu Claude perintah DevPilot yang benar
+  (`devpilot start|restart <service> --wait --json`, `devpilot logs <service> --json`). Ini mencegah
+  giliran Claude tertahan oleh proses yang tidak pernah selesai, dan port bentrok dengan service yang
+  sudah jalan.
+- **Tawaran restart setelah kode berubah.** Kalau Claude mengedit file di folder service yang sedang jalan
+  dan perintahnya tidak memantau file sendiri (mis. mode build `node dist/main.js`), band di atas prompt
+  menampilkan `↻ api: code changed since it started` dengan tombol **Restart ▸** (dikonfirmasi dulu) dan
+  **Dismiss**. Band hilang sendiri setelah service di-restart atau dihentikan.
+
 ## devpilot.yaml
 
 ```yaml

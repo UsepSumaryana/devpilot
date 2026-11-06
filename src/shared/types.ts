@@ -34,6 +34,7 @@ export interface ServiceView {
   name: string;
   status: ServiceStatus;
   run: string;
+  runs: string[]; // its commands across every mode (the panel guards against Claude running them by hand)
   cwd: string;
   port?: number;
   url?: string;

@@ -133,6 +133,13 @@ Setelah memperbarui plugin, jalankan `/reload-plugins`.
   dan perintahnya tidak memantau file sendiri (mis. mode build `node dist/main.js`), band di atas prompt
   menampilkan `↻ api: code changed since it started` dengan tombol **Restart ▸** (dikonfirmasi dulu) dan
   **Dismiss**. Band hilang sendiri setelah service di-restart atau dihentikan.
+- **Kartu incident di chat.** Saat service crash, gagal start, atau task gagal, sebuah kartu muncul di
+  transkrip: judul incident, kode keluar, restart ke berapa, status sekarang, dan beberapa baris log
+  terakhir, dengan tombol **✦ Diagnose** (mengirim prompt diagnosis ke Claude, tanpa mengubah apa pun),
+  **↻ Restart** (dikonfirmasi dulu) dan **≡ Logs**. Kartu hanya tampilan: Claude tidak membacanya
+  (notifikasi monitor tetap memberi tahu Claude), dan tidak muncul lagi setelah `--resume`.
+- **Autocomplete nama service.** Mengetik awal nama service (minimal 2 huruf, boleh diawali `#`) di
+  kotak prompt menawarkan service proyek ini beserta status dan port-nya.
 
 ## devpilot.yaml
 

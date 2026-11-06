@@ -32,6 +32,10 @@ const SUMMARY = {
 }
 
 const posts: string[] = []
+/** Incidents the daemon reports from the next poll on (the first poll only seeds what is already there). */
+const liveIncidents: any[] = []
+const placed: string[] = []
+const submitted: string[] = []
 
 const store: Record<string, unknown> = {}
 const opens: string[] = []
@@ -40,6 +44,18 @@ function engine(on: any, { daemonUp, project = true, pref }: { daemonUp: boolean
   for (const k of Object.keys(store)) delete store[k]
   if (pref !== undefined) store.paneOpen = pref
   opens.length = 0
+  liveIncidents.length = 0
+  placed.length = 0
+  submitted.length = 0
+  on('ui.place', (_: any, e: any) => {
+    placed.push(e.id)
+    return { value: { isPlaced: true, requestId: `row-${e.id}` } }
+  })
+  on('ui.notify', () => ({ value: { isSent: true, channel: 'test' } }))
+  on('prompt.submit', (_: any, e: any) => {
+    submitted.push(e.text)
+    return { text: e.text }
+  })
   on('command.register', () => ({ value: {} }))
   on('ui.open', (_: any, e: any) => {
     opens.push(e.id)
@@ -81,7 +97,7 @@ function engine(on: any, { daemonUp, project = true, pref }: { daemonUp: boolean
   on('http.fetch', (_: any, e: any) => {
     const url = String(e.url)
     if (e.init?.method === 'POST' || e.method === 'POST') posts.push(url.replace(/^https?:\/\/[^/]+/, ''))
-    const body = url.includes('/api/resolve') ? { workspace: 'demo-abc123' } : SUMMARY
+    const body = url.includes('/api/resolve') ? { workspace: 'demo-abc123' } : { ...SUMMARY, incidents: [...SUMMARY.incidents, ...liveIncidents] }
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } }
   })
 }
@@ -290,4 +306,75 @@ test('edits outside a running service, or to a stopped one, change nothing; Dism
   await again.press({ key: 'dismiss-changed' })
   expect(await again.find({ type: 'Button', key: 'restart-changed' })).toBeFalsy()
   await again.unmount()
+})
+
+const CRASH = {
+  id: 'inc_42',
+  at: 5000,
+  key: 'demo-abc123/worker',
+  workspace: 'demo-abc123',
+  service: 'worker',
+  kind: 'crash',
+  severity: 'error',
+  title: 'crashed (exit code 1)',
+  exitCode: 1,
+  restart: 2,
+  context: ['starting worker', '', 'TypeError: Cannot read properties of undefined', '    at main (worker.js:3:9)'],
+  count: 1,
+}
+const CARD = (surface: 'desktop' | 'terminal') => ({ plugin: 'devpilot-panel', component: 'Placed', props: { id: 'inc-inc_42', plugin: 'devpilot-panel' }, surface }) as const
+
+test('a new crash is placed as a card in the transcript; Diagnose asks Claude, Restart asks first', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  liveIncidents.push(CRASH)
+  await $.command.run({ command: 'services', args: '' }) // opening the pane polls again
+  expect(placed).toEqual(['inc-inc_42'])
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const card = await $.ui.mount(CARD(surface))
+    expect(await card.find({ type: 'Text', text: /worker: crashed \(exit code 1\)/ })).toBeTruthy()
+    expect(await card.find({ type: 'Text', text: /exit code 1 · restart 2/ })).toBeTruthy()
+    expect(await card.find({ type: 'Text', text: /TypeError: Cannot read properties/ })).toBeTruthy()
+    expect(await card.find({ type: 'Button', key: 'card-logs-inc-inc_42' })).toBeTruthy()
+    await card.unmount()
+  }
+
+  const card = await $.ui.mount(CARD('desktop'))
+  await card.press({ key: 'card-diagnose-inc-inc_42' })
+  expect(submitted).toHaveLength(1)
+  expect(submitted[0]).toMatch(/devpilot diagnose demo-abc123\/worker --json/)
+  expect(submitted[0]).toMatch(/don't change anything yet/)
+
+  posts.length = 0
+  await card.press({ key: 'card-restart-inc-inc_42' })
+  expect(posts).toHaveLength(0)
+  expect(await card.find({ type: 'Text', text: /Restart worker\?/ })).toBeTruthy()
+  await card.press({ key: 'card-restart-ok-inc-inc_42' })
+  expect(posts).toEqual(['/api/services/demo-abc123/worker/restart'])
+  await card.unmount()
+})
+
+test('incidents already open when the session starts get no card; warnings stay toasts', async ($, on) => {
+  engine(on, { daemonUp: true })
+  liveIncidents.push(CRASH) // there before the first poll
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  liveIncidents.push({ ...CRASH, id: 'inc_43', severity: 'warning', kind: 'unhealthy', title: 'health check failing' })
+  await $.command.run({ command: 'services', args: '' })
+  expect(placed).toHaveLength(0)
+})
+
+const typed = (text: string) => ({ text, cursor: text.length, token: text.split(' ').pop()!, start: text.lastIndexOf(' ') + 1 })
+
+test('typing a service-name prefix offers this project\u2019s services', async ($, on) => {
+  engine(on, { daemonUp: true })
+  on('prompt.autocomplete', () => ({ suggestions: [] }))
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'services', args: '' }) // a poll has finished, as long before anyone types
+  const r: any = await $.prompt.autocomplete(typed('kenapa wo'))
+  expect(r.suggestions).toEqual([{ text: 'worker', label: 'worker', description: 'DevPilot · demo · crashed' }])
+  const api: any = await $.prompt.autocomplete(typed('restart #ap'))
+  expect(api.suggestions[0]).toMatchObject({ text: 'api', description: 'DevPilot · demo · running · :4510' })
+  // Too short, already complete, or no match: nothing added.
+  for (const t of ['w', 'cek worker', 'zzz', 'a.b?c']) expect(((await $.prompt.autocomplete(typed(t))) as any).suggestions).toHaveLength(0)
 })

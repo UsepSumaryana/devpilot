@@ -26,6 +26,21 @@ export type Row = {
   startedAt: number | null;
 };
 
+/** An incident shown as a card in the transcript (crash, failed start, unhealthy...). */
+export type Card = {
+  id: string; // the placed row's id
+  incident: string;
+  key: string;
+  service: string;
+  kind: string;
+  title: string;
+  exitCode: number | null;
+  restart: number | null;
+  excerpt: string[]; // last log lines of its context
+  at: number;
+  step: 'idle' | 'confirm' | 'asked' | 'restarting' | 'restarted';
+};
+
 /** A running service whose source changed (Claude edited it) since it started. */
 export type Changed = { key: string; name: string; files: string[]; at: number };
 
@@ -75,6 +90,7 @@ declare module 'claude-code' {
       paneOpen: Shaped<boolean>;
       changed: Shaped<Changed[]>;
       restartAsk: Shaped<boolean>;
+      cards: Shaped<Record<string, Card>>;
     };
   }
 }

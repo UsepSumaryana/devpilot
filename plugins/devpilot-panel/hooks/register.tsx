@@ -4,7 +4,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Changed, Confirm, Row, Scope, Snapshot, Ws } from '../types'
+import type { Card, Changed, Confirm, Row, Scope, Snapshot, Ws } from '../types'
 
 const PANE = 'devpilot'
 const EMPTY: Snapshot = { daemon: 'unknown', detail: null, projectWs: null, workspaces: [], openIncidents: 0, updatedAt: 0 }
@@ -20,6 +20,8 @@ const paneOpen = atom({ plugin: 'devpilot-panel', key: 'paneOpen' } as const, fa
 // Running services whose code Claude edited since they started, and the band's "restart them?" step.
 const changed = atom({ plugin: 'devpilot-panel', key: 'changed' } as const, [] as Changed[], { shape: 'changed-1' })
 const restartAsk = atom({ plugin: 'devpilot-panel', key: 'restartAsk' } as const, false, { shape: 'restart-ask-1' })
+// Incident cards placed in the transcript, by row id.
+const cards = atom({ plugin: 'devpilot-panel', key: 'cards' } as const, {} as Record<string, Card>, { shape: 'cards-1' })
 
 type Daemon = { port: number; token: string }
 
@@ -176,8 +178,10 @@ async function pollOnce($: EngineInterface) {
       if (!seeded) continue
       if (projectWs && i.workspace !== projectWs) continue
       const text = `${i.service}: ${i.title}`
-      $.ui.toast(`DevPilot ${i.severity === 'error' ? '✖' : '⚠'} ${text}`, { timeoutMs: 8000 })
-      if (i.severity === 'error' && i.kind !== 'error-log') void $.ui.notify(text, { title: 'DevPilot' })
+      const serious = i.severity === 'error' && i.kind !== 'error-log'
+      // A serious one gets a card in the transcript (with Diagnose / Restart / Logs); the rest a toast.
+      if (!serious || !(await placeCard($, i))) $.ui.toast(`DevPilot ${i.severity === 'error' ? '✖' : '⚠'} ${text}`, { timeoutMs: 8000 })
+      if (serious) void $.ui.notify(text, { title: 'DevPilot' })
     }
     seeded = true
   }
@@ -501,6 +505,48 @@ const diagnosePrompt = (r: Row) =>
 const triagePrompt = (w: Ws) =>
   `Summarise the open DevPilot incidents of workspace ${w.id} (\`devpilot incidents --open --ws ${w.id} --json\`), most important first, and say which need action. Don't change anything.`
 
+// ------------------------------------------------------- incident cards
+const MAX_CARDS = 30
+
+/** Places a card for incident `i` at the transcript's end; false when no surface draws it. */
+async function placeCard($: EngineInterface, i: any): Promise<boolean> {
+  const id = `inc-${String(i.id).replace(/[^A-Za-z0-9_-]/g, '')}`.slice(0, 64)
+  const card: Card = {
+    id,
+    incident: String(i.id),
+    key: String(i.key),
+    service: String(i.service),
+    kind: String(i.kind),
+    title: String(i.title),
+    exitCode: typeof i.exitCode === 'number' ? i.exitCode : null,
+    restart: typeof i.restart === 'number' ? i.restart : null,
+    excerpt: (Array.isArray(i.context) ? i.context : [])
+      .map((l: unknown) => String(l))
+      .filter((l: string) => l.trim())
+      .slice(-6),
+    at: typeof i.at === 'number' ? i.at : Date.now(),
+    step: 'idle',
+  }
+  await update($, cards, (m): Record<string, Card> => {
+    const keep = Object.values(m)
+      .sort((a, b) => b.at - a.at)
+      .slice(0, MAX_CARDS - 1)
+    return Object.fromEntries([...keep.map((c) => [c.id, c] as const), [id, card] as const])
+  })
+  try {
+    return (await $.ui.place({ id })).isPlaced
+  } catch {
+    return false
+  }
+}
+
+async function setStep($: EngineInterface, id: string, step: Card['step']) {
+  await update($, cards, (m): Record<string, Card> => (m[id] ? { ...m, [id]: { ...m[id]!, step } } : m))
+}
+
+const cardPrompt = (c: Card) =>
+  `DevPilot service ${c.key} had an incident: ${c.title}${c.exitCode !== null ? ` (exit code ${c.exitCode})` : ''}. Diagnose it with \`devpilot diagnose ${c.key} --json\` and propose a fix — don't change anything yet.`
+
 // ------------------------------------------------- guard and code changes
 // Claude starting a managed service itself (`yarn start:dev` in its folder) blocks the turn and
 // races DevPilot for the port; an edit to a service without a watcher leaves it on old code.
@@ -713,6 +759,79 @@ export const register: Register = (on) => {
         </Box>
       </Box>
     )
+  })
+
+  // An incident card in the transcript: what happened, the last log lines, and what to do next.
+  on('ui.render', { component: 'Placed' }, async ($, e, next) => {
+    if (e.props.plugin !== 'devpilot-panel') return next(e)
+    const card = (await read($, cards))[e.props.id]
+    if (!card) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const snap = await read($, snapshot)
+    const row = snap.workspaces.flatMap((w) => w.services).find((r) => r.key === card.key)
+    const recovered = !!row && row.status === 'running' && (row.startedAt ?? 0) > card.at
+    const now = !row ? (snap.daemon === 'up' ? 'no longer registered' : 'daemon off') : recovered ? 'running again' : row.status
+    const facts = [card.exitCode !== null ? `exit code ${card.exitCode}` : '', card.restart ? `restart ${card.restart}` : '', new Date(card.at).toLocaleTimeString()].filter(Boolean).join(' · ')
+    return (
+      <Box key={`card-${card.id}`} flexDirection="column" gap="sm" borderStyle="round" borderColor={recovered ? 'success' : 'error'} padding="md">
+        <Box flexDirection="row" gap="sm" alignItems="center">
+          <Text color={recovered ? 'success' : 'error'}>{recovered ? '✔' : '✖'}</Text>
+          <Text weight="semibold">{`${card.service}: ${card.title}`}</Text>
+          <Text dimColor>{card.key}</Text>
+        </Box>
+        <Text dimColor>{`${facts}${facts ? ' · ' : ''}now ${now}`}</Text>
+        {card.excerpt.length > 0 && (
+          <Box flexDirection="column">
+            {card.excerpt.map((l, n) => (
+              <Text key={`l${n}`} mono size="caption" dimColor wrap="truncate-end">
+                {`│ ${l}`}
+              </Text>
+            ))}
+          </Box>
+        )}
+        {card.step === 'confirm' ? (
+          <Box flexDirection="row" gap="sm" alignItems="center">
+            <Text>{`Restart ${card.service}? It stops and starts again.`}</Text>
+            <Button key={`card-restart-ok-${card.id}`} variant="primary" label="Restart" onPress={async () => {
+              await setStep($, card.id, 'restarting')
+              await act($, `Restarting ${card.service}`, 'POST', `/api/services/${card.key}/restart`, { background: true })
+              await setStep($, card.id, 'restarted')
+            }} />
+            <Button key={`card-restart-cancel-${card.id}`} plain dimColor label="Cancel" onPress={() => setStep($, card.id, 'idle')} />
+          </Box>
+        ) : (
+          <Box flexDirection="row" gap="sm" alignItems="center">
+            <Button key={`card-diagnose-${card.id}`} variant="primary" label={card.step === 'asked' ? '✦ Asked Claude' : '✦ Diagnose'} onPress={async () => {
+              await setStep($, card.id, 'asked')
+              await $.prompt.submit({ text: cardPrompt(card), asUser: true })
+            }} />
+            <Button key={`card-restart-${card.id}`} label={card.step === 'restarting' ? 'Restarting…' : card.step === 'restarted' ? '↻ Restarted' : '↻ Restart'} onPress={() => (card.step === 'restarting' ? undefined : setStep($, card.id, 'confirm'))} />
+            <Button key={`card-logs-${card.id}`} label="≡ Logs" onPress={() => openDashboard($, `/service/${card.key}/logs`)} />
+          </Box>
+        )}
+      </Box>
+    )
+  })
+
+  // Service names in the prompt box: typing a prefix offers the names of this project's services.
+  on('prompt.autocomplete', async ($, e, next) => {
+    const base = await next(e)
+    const token = e.token.replace(/^#/, '')
+    if (token.length < 2 || /[^\w./-]/.test(token)) return base
+    const snap = await read($, snapshot)
+    if (snap.daemon !== 'up') return base
+    const mine = snap.workspaces.find((w) => w.id === snap.projectWs)
+    const pool = (mine ? [mine] : snap.workspaces).flatMap((w) => w.services.map((r) => ({ r, w })))
+    const lower = token.toLowerCase()
+    const hits = pool
+      .filter(({ r }) => (r.name.toLowerCase().startsWith(lower) || r.key.toLowerCase().startsWith(lower)) && r.name.toLowerCase() !== lower && r.key.toLowerCase() !== lower)
+      .slice(0, 8)
+      .map(({ r, w }) => ({
+        text: r.key.toLowerCase().startsWith(lower) && !r.name.toLowerCase().startsWith(lower) ? r.key : r.name,
+        label: r.name,
+        description: `DevPilot · ${w.name} · ${r.status}${r.port ? ` · :${r.port}` : ''}`,
+      }))
+    return hits.length ? { suggestions: [...base.suggestions, ...hits] } : base
   })
 
   // Claude starting a service DevPilot manages: refuse, and say how to do it through DevPilot.

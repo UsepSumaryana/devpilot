@@ -41,6 +41,9 @@ export type Card = {
   step: 'idle' | 'confirm' | 'asked' | 'restarting' | 'restarted';
 };
 
+/** Workspace CPU (percent of the machine) and memory (bytes) over the last 15 minutes. */
+export type Usage = { ws: string | null; points: { t: number; cpu: number; mem: number }[]; at: number };
+
 /** A running service whose source changed (Claude edited it) since it started. */
 export type Changed = { key: string; name: string; files: string[]; at: number };
 
@@ -91,6 +94,7 @@ declare module 'claude-code' {
       changed: Shaped<Changed[]>;
       restartAsk: Shaped<boolean>;
       cards: Shaped<Record<string, Card>>;
+      usage: Shaped<Usage>;
     };
   }
 }

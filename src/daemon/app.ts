@@ -248,6 +248,33 @@ export function createApp({ sup, token, startedAt, dashboardDir, shutdown }: App
     return c.json({ range, points: sup.history(key(c), range) });
   });
 
+  // Workspace totals over time: per service averaged into steps, then summed.
+  app.get('/api/workspaces/:ws/metrics', (c) => {
+    const range = (c.req.query('range') as '15m' | '1h' | '24h') || '15m';
+    const step = range === '15m' ? 10_000 : range === '1h' ? 30_000 : 600_000;
+    const services = sup.workspaceViews(c.req.param('ws'))[0]?.services ?? [];
+    const total = new Map<number, { cpu: number; mem: number }>();
+    for (const s of services) {
+      const per = new Map<number, { cpu: number; n: number; mem: number }>();
+      for (const p of sup.history(s.key, range)) {
+        const b = Math.floor(p.t / step) * step;
+        const cur = per.get(b) ?? { cpu: 0, n: 0, mem: 0 };
+        cur.cpu += p.cpu;
+        cur.n++;
+        cur.mem = Math.max(cur.mem, p.mem);
+        per.set(b, cur);
+      }
+      for (const [b, v] of per) {
+        const t = total.get(b) ?? { cpu: 0, mem: 0 };
+        t.cpu += v.cpu / v.n;
+        t.mem += v.mem;
+        total.set(b, t);
+      }
+    }
+    const points = [...total.entries()].sort((a, b) => a[0] - b[0]).map(([t, v]) => ({ t, cpu: Math.round(v.cpu * 10) / 10, mem: v.mem }));
+    return c.json({ range, step, points });
+  });
+
   app.get('/api/services/:ws/:svc/diagnose', async (c) => c.json(await diagnose(sup, key(c))));
 
   app.get('/api/services/:ws/:svc/env', (c) => {

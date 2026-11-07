@@ -140,6 +140,15 @@ Setelah memperbarui plugin, jalankan `/reload-plugins`.
   (notifikasi monitor tetap memberi tahu Claude), dan tidak muncul lagi setelah `--resume`.
 - **Autocomplete nama service.** Mengetik awal nama service (minimal 2 huruf, boleh diawali `#`) di
   kotak prompt menawarkan service proyek ini beserta status dan port-nya.
+- **Agent diagnosis `devpilot:diagnoser`** (dari plugin `devpilot`). Tombol ✦ Diagnose dan Ask Claude meminta
+  Claude memakai agent ini: ia mengumpulkan bukti lewat `devpilot diagnose/logs/incidents/metrics` dan kode,
+  lalu melaporkan penyebab dan usulan perbaikan tanpa mengubah apa pun. Panel menolak perintah agent ini yang
+  bisa mengubah sesuatu (restart, install, menulis file, membuka `.env`, `--reveal`).
+- **Grafik resource.** Panel menampilkan CPU dan memori workspace selama 15 menit terakhir (garis di desktop,
+  karakter blok di terminal) plus tiga service yang paling banyak memakai memori.
+- **Tool DevPilot untuk Claude.** Panel mendaftarkan `mcp__devpilot-panel__status`, `logs`, `incidents`,
+  `diagnose`, `metrics` (tanpa permintaan izin, hanya membaca) serta `start`, `restart`, `stop`, `run_task`
+  (tetap meminta izin). CLI `devpilot … --json` tetap berlaku; tool ini hanya jalan pintas tanpa shell.
 
 ## devpilot.yaml
 

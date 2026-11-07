@@ -12,6 +12,12 @@ need to read the result; the human-readable form is for showing the user.
 Services keep running after this session ends. The user watches the same state in
 the web dashboard (`devpilot open`) and the Claude desktop panel.
 
+When the DevPilot panel is installed, the same queries and actions are also tools:
+`mcp__devpilot-panel__status`, `logs`, `incidents`, `diagnose`, `metrics` (read-only, no
+prompt) and `start`, `restart`, `stop`, `run_task`. Use them or the CLI, whichever is at hand.
+To investigate a failing service, delegate to the read-only `devpilot:diagnoser` agent and
+relay its cause and proposed fix; apply nothing until the user agrees.
+
 ## Commands
 
 | Goal | Command |

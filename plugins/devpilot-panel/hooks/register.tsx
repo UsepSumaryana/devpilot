@@ -4,7 +4,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Card, Changed, Confirm, Row, Scope, Snapshot, Ws } from '../types'
+import type { Card, Changed, Confirm, Row, Scope, Snapshot, Usage, Ws } from '../types'
 
 const PANE = 'devpilot'
 const EMPTY: Snapshot = { daemon: 'unknown', detail: null, projectWs: null, workspaces: [], openIncidents: 0, updatedAt: 0 }
@@ -22,6 +22,8 @@ const changed = atom({ plugin: 'devpilot-panel', key: 'changed' } as const, [] a
 const restartAsk = atom({ plugin: 'devpilot-panel', key: 'restartAsk' } as const, false, { shape: 'restart-ask-1' })
 // Incident cards placed in the transcript, by row id.
 const cards = atom({ plugin: 'devpilot-panel', key: 'cards' } as const, {} as Record<string, Card>, { shape: 'cards-1' })
+// The pane's resources chart.
+const usage = atom({ plugin: 'devpilot-panel', key: 'usage' } as const, { ws: null, points: [], at: 0 } as Usage, { shape: 'usage-1' })
 
 type Daemon = { port: number; token: string }
 
@@ -168,6 +170,18 @@ async function pollOnce($: EngineInterface) {
 
     const mine = workspaces.find((w) => w.id === projectWs)
     const rows = (mine ? [mine] : workspaces).flatMap((w) => w.services)
+
+    const chartWs = mine?.id ?? workspaces[0]?.id ?? null
+    const was = await read($, usage)
+    if (chartWs && (await read($, paneOpen)) && (was.ws !== chartWs || Date.now() - was.at > 10_000)) {
+      try {
+        const m = await call($, d, 'GET', `/api/workspaces/${chartWs}/metrics?range=15m`)
+        const points = Array.isArray(m?.points) ? m.points.filter((p: any) => typeof p.t === 'number') : []
+        await update($, usage, (): Usage => ({ ws: chartWs, points, at: Date.now() }))
+      } catch {
+        /* an older daemon has no workspace metrics: no chart */
+      }
+    }
     const up = rows.filter((r) => r.status === 'running').length
     const bad = rows.filter((r) => FAILING.includes(r.status)).length
     $.ui.status(rows.length ? `devpilot ${up}/${rows.length} up${bad ? ` · ${bad} failing` : ''}` : undefined)
@@ -500,10 +514,152 @@ function barSvg(services: Row[], widthPx: number): string {
 }
 
 const diagnosePrompt = (r: Row) =>
-  `DevPilot service ${r.key} is ${r.status}${r.lastError ? ` (${r.lastError})` : ''}. Diagnose it with \`devpilot diagnose ${r.key} --json\` and propose a fix — don't change anything yet.`
+  `DevPilot service ${r.key} is ${r.status}${r.lastError ? ` (${r.lastError})` : ''}. Diagnose it with the devpilot:diagnoser agent (read-only; it starts from \`devpilot diagnose ${r.key} --json\`) and propose a fix — don't change anything yet.`
 
 const triagePrompt = (w: Ws) =>
   `Summarise the open DevPilot incidents of workspace ${w.id} (\`devpilot incidents --open --ws ${w.id} --json\`), most important first, and say which need action. Don't change anything.`
+
+// ------------------------------------------------------------ resources
+const fmtMem = (bytes: number) => (bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`)
+
+/** A line with a soft area under it, scaled to `top`. */
+function lineSvg(values: number[], widthPx: number, h: number, color: string, top: number): string {
+  const w = Math.max(80, Math.round(widthPx))
+  if (values.length < 2) return svg(w, h, `<rect x="0" y="${h - 1}" width="${w}" height="1" fill="${C.border}"/>`)
+  const max = Math.max(top, 1e-9)
+  const pts = values.map((v, i) => [(i / (values.length - 1)) * w, h - 2 - (Math.min(v, max) / max) * (h - 4)] as const)
+  const line = pts.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join(' ')
+  return svg(w, h, `<rect x="0" y="${h - 1}" width="${w}" height="1" fill="${C.border}"/><path d="${line} L${w} ${h} L0 ${h} Z" fill="${color}" fill-opacity="0.12"/><path d="${line}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round"/>`)
+}
+
+/** The same values as block characters, for a surface without Svg. */
+function spark(values: number[], top: number, n = 28): string {
+  const marks = '▁▂▃▄▅▆▇█'
+  const max = Math.max(top, 1e-9)
+  return values
+    .slice(-n)
+    .map((v) => marks[Math.min(7, Math.max(0, Math.round((Math.min(v, max) / max) * 7)))])
+    .join('')
+}
+
+// ------------------------------------------------- the diagnoser is read-only
+const DIAGNOSER = 'devpilot:diagnoser'
+const agentTypes = new Map<string, string>()
+
+async function isDiagnoser($: EngineInterface, agentId: string | undefined): Promise<boolean> {
+  if (!agentId) return false
+  if (!agentTypes.has(agentId)) {
+    try {
+      for (const a of await $.agent.list()) agentTypes.set(a.id, a.type)
+    } catch {
+      return false
+    }
+  }
+  return agentTypes.get(agentId) === DIAGNOSER
+}
+
+const DEVPILOT_READ = /^devpilot(?:\.cmd)?\s+(?:(?:status|ps|st|ls|logs?|diagnose|diag|doctor|metrics|ports|help|version|incidents)\b(?!.*\b(?:clear|kill)\b)|env\b(?!.*(?:--reveal|\buse\b))|mode\s*(?:$|--)|task\s*(?:$|--|list\b))/
+const SHELL_READ = /^(?:git\s+(?:log|diff|show|status|blame|branch)\b|ls\b|dir\b|cat\b|head\b|tail\b|grep\b|rg\b|find\b(?!.*\s-(?:delete|exec|ok)\b)|wc\b|type\b|Get-Content\b|Get-ChildItem\b|Select-String\b|netstat\b|tasklist\b|ps\b|pwd\b|echo\b|which\b|where\b|cd\b)/
+
+/** A command the read-only diagnoser may run: devpilot queries and plain reads, no writes, no secrets. */
+function readOnlyCommand(command: string): string | null {
+  const c = command.replace(/\d?>\s*(?:\/dev\/null|NUL|\$null)|2>&1/g, '')
+  if (/\.env\b/.test(c)) return 'it touches a .env file (secrets stay closed)'
+  if (/>|\btee\b/.test(c)) return 'it writes to a file'
+  const bad = c
+    .split(/&&|\|\||;|\||\n/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .find((s) => !DEVPILOT_READ.test(s) && !SHELL_READ.test(s))
+  return bad ? `\`${bad.slice(0, 80)}\` is not a read-only command` : null
+}
+
+// ---------------------------------------------------------- model tools
+// The devpilot CLI's main verbs as tools of their own: no shell, no quoting, structured answers.
+type ToolDef = { name: string; description: string; read: boolean; inputSchema: Record<string, unknown> }
+const svcProp = { type: 'string', description: 'Service name in this project (e.g. "api"), or "<workspace>/<service>"' }
+const TOOLS: ToolDef[] = [
+  { name: 'status', read: true, description: 'DevPilot: the services of this project (or one service, or every workspace) — state, health, port, CPU/memory, restarts, open incidents, mode.', inputSchema: { type: 'object', properties: { service: { ...svcProp, description: 'One service; omit for the whole workspace' }, all: { type: 'boolean', description: 'Every registered workspace' } } } },
+  { name: 'logs', read: true, description: 'DevPilot: log lines of a service (stdout, stderr, and DevPilot\'s own lines), newest last.', inputSchema: { type: 'object', properties: { service: svcProp, tail: { type: 'number', description: 'How many lines (default 100, at most 1000)' }, grep: { type: 'string', description: 'Regex the lines must match' }, since: { type: 'string', description: 'Only lines newer than this, e.g. "5m", "1h"' }, stream: { type: 'string', enum: ['out', 'err', 'sys'] } }, required: ['service'] } },
+  { name: 'incidents', read: true, description: 'DevPilot: crashes, failed starts, health failures, memory alarms and error bursts of this project (or one service).', inputSchema: { type: 'object', properties: { service: svcProp, open: { type: 'boolean', description: 'Only unresolved ones' }, since: { type: 'string', description: 'e.g. "1h"' } } } },
+  { name: 'diagnose', read: true, description: 'DevPilot: triage report of a service — verdict, findings with suggestions, the last error block, dependencies, port holder, missing env.', inputSchema: { type: 'object', properties: { service: svcProp }, required: ['service'] } },
+  { name: 'metrics', read: true, description: 'DevPilot: CPU (percent of the machine), memory (bytes) and health latency history of a service.', inputSchema: { type: 'object', properties: { service: svcProp, range: { type: 'string', enum: ['15m', '1h', '24h'] } }, required: ['service'] } },
+  { name: 'start', read: false, description: 'DevPilot: start a service in the background (dependencies first, its mode\'s tasks included) and wait until it is ready; returns the reason and last log lines on failure.', inputSchema: { type: 'object', properties: { service: svcProp, mode: { type: 'string', description: 'Run in this mode (e.g. "build"); omit for its current one' }, wait: { type: 'boolean', description: 'Wait until ready (default true)' } }, required: ['service'] } },
+  { name: 'restart', read: false, description: 'DevPilot: restart a service and wait until it is ready again; use after a fix to verify it.', inputSchema: { type: 'object', properties: { service: svcProp, wait: { type: 'boolean', description: 'Wait until ready (default true)' } }, required: ['service'] } },
+  { name: 'stop', read: false, description: 'DevPilot: stop a service (its process tree).', inputSchema: { type: 'object', properties: { service: svcProp }, required: ['service'] } },
+  { name: 'run_task', read: false, description: 'DevPilot: run a one-shot task from devpilot.yaml (install, build, migrate...) of the workspace or of one service, and wait for it; returns its status and last output lines.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, service: { ...svcProp, description: 'The service whose task it is; omit for a workspace task' } }, required: ['task'] } },
+]
+const TOOL_PREFIX = 'mcp__devpilot-panel__'
+
+const sinceMs = (s: unknown): number | null => {
+  const m = typeof s === 'string' ? /^(\d+)\s*(s|m|h|d)$/.exec(s.trim()) : null
+  return m ? Date.now() - Number(m[1]) * { s: 1e3, m: 6e4, h: 36e5, d: 864e5 }[m[2] as 's'] : null
+}
+
+async function serveTool($: EngineInterface, name: string, input: Record<string, unknown>): Promise<unknown> {
+  const d = await daemonInfo($)
+  if (!d) throw new Error('The DevPilot daemon is not running. Start it with `devpilot daemon start` (or `devpilot up`).')
+  const here = cwd || (await $.session.cwd())
+  const keyOf = async (ref: unknown) => {
+    if (typeof ref !== 'string' || !ref.trim()) throw new Error('Which service? Pass `service` (see the status tool).')
+    return String((await call($, d, 'GET', `/api/resolve?ref=${encodeURIComponent(ref.trim())}&cwd=${encodeURIComponent(here)}`)).key)
+  }
+  const wsHere = async () => (await call($, d, 'GET', `/api/resolve?cwd=${encodeURIComponent(here)}`)).workspace as string | null
+  const svc = (k: string) => `/api/services/${k}`
+  switch (name) {
+    case 'status': {
+      if (input.service) return call($, d, 'GET', svc(await keyOf(input.service)))
+      const ws = input.all ? null : await wsHere()
+      return call($, d, 'GET', `/api/summary${ws ? `?ws=${ws}` : ''}`)
+    }
+    case 'logs': {
+      const q = new URLSearchParams({ tail: String(Math.min(1000, Math.max(1, Number(input.tail) || 100))) })
+      if (typeof input.grep === 'string') q.set('grep', input.grep)
+      if (typeof input.stream === 'string') q.set('stream', input.stream)
+      const since = sinceMs(input.since)
+      if (since) q.set('since', String(since))
+      const r = await call($, d, 'GET', `${svc(await keyOf(input.service))}/logs?${q}`)
+      return { lines: (r.lines || []).map((l: any) => `${l.stream === 'err' ? 'ERR ' : l.stream === 'sys' ? 'SYS ' : ''}${l.text}`) }
+    }
+    case 'incidents': {
+      const q = new URLSearchParams({ limit: '20' })
+      if (input.service) q.set('key', await keyOf(input.service))
+      else {
+        const ws = await wsHere()
+        if (ws) q.set('ws', ws)
+      }
+      if (input.open) q.set('open', '1')
+      const since = sinceMs(input.since)
+      if (since) q.set('since', String(since))
+      return call($, d, 'GET', `/api/incidents?${q}`)
+    }
+    case 'diagnose':
+      return call($, d, 'GET', `${svc(await keyOf(input.service))}/diagnose`)
+    case 'metrics':
+      return call($, d, 'GET', `${svc(await keyOf(input.service))}/metrics?range=${input.range === '1h' || input.range === '24h' ? input.range : '15m'}`)
+    case 'start':
+      return call($, d, 'POST', `${svc(await keyOf(input.service))}/start`, { wait: input.wait !== false, deps: true, mode: typeof input.mode === 'string' ? input.mode : undefined })
+    case 'restart':
+      return call($, d, 'POST', `${svc(await keyOf(input.service))}/restart`, { wait: input.wait !== false })
+    case 'stop':
+      return call($, d, 'POST', `${svc(await keyOf(input.service))}/stop`, {})
+    case 'run_task': {
+      if (typeof input.task !== 'string' || !input.task) throw new Error('Which task? Pass `task`.')
+      const key = input.service ? await keyOf(input.service) : null
+      const ws = key ? key.split('/')[0]! : await wsHere()
+      if (!ws) throw new Error('This folder is not a DevPilot workspace.')
+      let run = await call($, d, 'POST', `/api/workspaces/${ws}/tasks`, { task: input.task, service: key ? key.split('/')[1] : undefined })
+      const until = Date.now() + 30 * 60_000
+      while (run?.status === 'running' && Date.now() < until) {
+        await $.clock.sleep(1000)
+        run = await call($, d, 'GET', `/api/tasks/${run.id}`)
+      }
+      const logs = run?.logKey ? await call($, d, 'GET', `/api/services/${run.logKey}/logs?tail=40`).catch(() => null) : null
+      return { ...run, output: (logs?.lines || []).map((l: any) => l.text) }
+    }
+  }
+  throw new Error(`Unknown DevPilot tool ${name}`)
+}
 
 // ------------------------------------------------------- incident cards
 const MAX_CARDS = 30
@@ -545,7 +701,7 @@ async function setStep($: EngineInterface, id: string, step: Card['step']) {
 }
 
 const cardPrompt = (c: Card) =>
-  `DevPilot service ${c.key} had an incident: ${c.title}${c.exitCode !== null ? ` (exit code ${c.exitCode})` : ''}. Diagnose it with \`devpilot diagnose ${c.key} --json\` and propose a fix — don't change anything yet.`
+  `DevPilot service ${c.key} had an incident: ${c.title}${c.exitCode !== null ? ` (exit code ${c.exitCode})` : ''}. Diagnose it with the devpilot:diagnoser agent (read-only; it starts from \`devpilot diagnose ${c.key} --json\`) and propose a fix — don't change anything yet.`
 
 // ------------------------------------------------- guard and code changes
 // Claude starting a managed service itself (`yarn start:dev` in its folder) blocks the turn and
@@ -689,6 +845,13 @@ export const register: Register = (on) => {
     $.clock.every(2000, () => tick($))
     tick($)
     // Each name on its own: one refused name (a built-in's) must not cost the others.
+    for (const t of TOOLS) {
+      try {
+        await $.tool.register({ name: t.name, description: t.description, inputSchema: t.inputSchema, ...(t.name === 'status' ? { isDeferred: false } : {}) })
+      } catch {
+        /* the CLI covers the same ground */
+      }
+    }
     for (const name of ['devpilot-panel', 'services', 'dp-services']) {
       try {
         await $.command.register({ name, description: 'Show or hide the DevPilot services pane' })
@@ -836,6 +999,10 @@ export const register: Register = (on) => {
 
   // Claude starting a service DevPilot manages: refuse, and say how to do it through DevPilot.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    if (typeof e.command === 'string' && (await isDiagnoser($, e.agentId))) {
+      const why = readOnlyCommand(e.command)
+      if (why) return { deny: `The DevPilot diagnoser is read-only and ${why}. Put the change or command in your report as the proposed fix instead.` }
+    }
     if ((await read($, snapshot)).daemon === 'unknown') await pollOnce($).catch(() => undefined) // no poll has finished yet
     const snap = await read($, snapshot)
     if (snap.daemon !== 'up' || typeof e.command !== 'string') return next(e)
@@ -844,6 +1011,28 @@ export const register: Register = (on) => {
     const ws = snap.workspaces.find((w) => w.services.some((r) => r.key === hit.row.key))
     $.ui.toast(`DevPilot: kept Claude from starting ${hit.row.name} outside DevPilot`, { timeoutMs: 6000 })
     return { deny: guardText(hit, ws?.name ?? hit.row.key.split('/')[0]!) }
+  })
+
+  // The tools registered at session start: served here, against the daemon.
+  for (const t of TOOLS) {
+    on('tool.call', { tool: (TOOL_PREFIX + t.name) as 'Bash' /* a registered tool's name, not a built-in's */ }, async ($, e) => {
+      if (!t.read && (await isDiagnoser($, e.agentId))) return { deny: 'The DevPilot diagnoser is read-only: propose the action in your report instead.' }
+      const { tool: _t, tool_use_id: _id, consent: _c, agentId: _a, ...input } = e as unknown as Record<string, unknown>
+      try {
+        const result = await serveTool($, t.name, input)
+        if (!t.read) void tick($)
+        return { result }
+      } catch (err) {
+        return { deny: String((err as Error).message || err) }
+      }
+    })
+  }
+
+  // Reading DevPilot needs no permission prompt; starting, stopping and tasks keep theirs.
+  on('tool.check', async ($, e, next) => {
+    const name = String((e as unknown as { tool?: unknown }).tool ?? '')
+    const t = name.startsWith(TOOL_PREFIX) ? TOOLS.find((x) => TOOL_PREFIX + x.name === name) : undefined
+    return t?.read ? { decision: 'allow', reason: 'DevPilot read-only query' } : next(e)
   })
 
   // Claude edited a file of a running service that does not reload by itself: offer a restart.
@@ -865,6 +1054,7 @@ export const register: Register = (on) => {
     const working = await read($, busy)
     const menuOpen = await read($, menu)
     const pending = await read($, confirm)
+    const use = await read($, usage)
 
     // Svg where the surface draws it, a glyph elsewhere (the terminal).
     const pic = (source: string, alt: string, glyph: string, color: string, pw: number, ph: number) =>
@@ -1174,6 +1364,52 @@ export const register: Register = (on) => {
                   </Box>
                 )
               })}
+
+              {/* resources */}
+              {use.ws === w.id && use.points.length > 1 && (() => {
+                const cpu = use.points.map((p) => p.cpu)
+                const mem = use.points.map((p) => p.mem)
+                const cpuTop = Math.max(10, ...cpu) * 1.15
+                const memTop = Math.max(...mem, 1) * 1.15
+                const width = ((e.props.bodyColumns ?? 44) - 4) * 8.6
+                const heavy = w.services
+                  .filter((r) => LIVE.includes(r.status) && (r.memMb ?? 0) > 0)
+                  .sort((a, b) => (b.memMb ?? 0) - (a.memMb ?? 0))
+                  .slice(0, 3)
+                  .map((r) => `${r.name} ${r.cpu !== null ? `${Math.round(r.cpu)}%` : ''} · ${r.memMb} MB`)
+                const chart = (label: string, value: string, values: number[], top: number, color: string) => (
+                  <Box key={`res-${label}`} flexDirection="column" gap="xs">
+                    <Box flexDirection="row" justifyContent="space-between" paddingX="sm">
+                      <Text size="caption" color={C.muted}>
+                        {label}
+                      </Text>
+                      <Text size="caption" weight="semibold">
+                        {value}
+                      </Text>
+                    </Box>
+                    <Box paddingX="sm">
+                      {Svg && e.surface !== 'terminal' ? <Svg source={lineSvg(values, width, 36, color, top)} alt={`${label} ${value}`} height={36} /> : <Text color={color}>{spark(values, top)}</Text>}
+                    </Box>
+                  </Box>
+                )
+                return (
+                  <Box key={`res-${w.id}`} flexDirection="column" gap="sm">
+                    {divider()}
+                    <Box flexDirection="row" justifyContent="space-between" paddingX="sm">
+                      <Text size="footnote" weight="semibold" color={C.muted}>
+                        RESOURCES · 15 MIN
+                      </Text>
+                    </Box>
+                    {chart('CPU', `${cpu[cpu.length - 1]!.toFixed(1)}%`, cpu, cpuTop, C.blue)}
+                    {chart('Memory', fmtMem(mem[mem.length - 1]!), mem, memTop, '#720455')}
+                    {heavy.length > 0 && (
+                      <Text size="caption" color={C.muted} wrap="truncate-end">
+                        {`Top: ${heavy.join(' · ')}`}
+                      </Text>
+                    )}
+                  </Box>
+                )
+              })()}
 
               {/* footer */}
               {divider()}

@@ -36,6 +36,7 @@ const posts: string[] = []
 const liveIncidents: any[] = []
 const placed: string[] = []
 const submitted: string[] = []
+const registeredTools: string[] = []
 
 const store: Record<string, unknown> = {}
 const opens: string[] = []
@@ -47,6 +48,14 @@ function engine(on: any, { daemonUp, project = true, pref }: { daemonUp: boolean
   liveIncidents.length = 0
   placed.length = 0
   submitted.length = 0
+  registeredTools.length = 0
+  on('tool.register', (_: any, e: any) => {
+    registeredTools.push(e.name)
+    return { value: { tool: `mcp__devpilot-panel__${e.name}` } }
+  })
+  on('agent.list', () => ({ value: [{ id: 'diag-1', type: 'devpilot:diagnoser', description: 'why api is down', status: 'running' }] }))
+  // The engine's own verdict beneath the plugin: DevPilot tools would be asked, the rest allowed.
+  on('tool.check', (_: any, e: any) => ({ decision: String(e.tool).startsWith('mcp__devpilot-panel__') ? 'ask' : 'allow' }))
   on('ui.place', (_: any, e: any) => {
     placed.push(e.id)
     return { value: { isPlaced: true, requestId: `row-${e.id}` } }
@@ -97,7 +106,15 @@ function engine(on: any, { daemonUp, project = true, pref }: { daemonUp: boolean
   on('http.fetch', (_: any, e: any) => {
     const url = String(e.url)
     if (e.init?.method === 'POST' || e.method === 'POST') posts.push(url.replace(/^https?:\/\/[^/]+/, ''))
-    const body = url.includes('/api/resolve') ? { workspace: 'demo-abc123' } : { ...SUMMARY, incidents: [...SUMMARY.incidents, ...liveIncidents] }
+    const body = url.includes('/api/resolve')
+      ? { workspace: 'demo-abc123', key: url.includes('ref=web') ? 'demo-abc123/web' : 'demo-abc123/api' }
+      : /\/api\/workspaces\/[^/]+\/metrics/.test(url)
+        ? { range: '15m', step: 10000, points: [{ t: 1, cpu: 4, mem: 300 * 1048576 }, { t: 2, cpu: 9.5, mem: 320 * 1048576 }, { t: 3, cpu: 12.5, mem: 350 * 1048576 }] }
+        : url.includes('/logs')
+          ? { lines: [{ seq: 1, t: 1, stream: 'out', text: 'listening on 4510' }, { seq: 2, t: 2, stream: 'err', text: 'warn: slow query' }], lastSeq: 2 }
+          : /\/(start|restart|stop)$/.test(url)
+            ? { ok: true, key: 'demo-abc123/api', status: 'running' }
+            : { ...SUMMARY, incidents: [...SUMMARY.incidents, ...liveIncidents] }
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } }
   })
 }
@@ -377,4 +394,70 @@ test('typing a service-name prefix offers this project\u2019s services', async (
   expect(api.suggestions[0]).toMatchObject({ text: 'api', description: 'DevPilot · demo · running · :4510' })
   // Too short, already complete, or no match: nothing added.
   for (const t of ['w', 'cek worker', 'zzz', 'a.b?c']) expect(((await $.prompt.autocomplete(typed(t))) as any).suggestions).toHaveLength(0)
+})
+
+const said = (r: any) => String(r.deny ?? (r.isError ? r.text : ''))
+
+test('DevPilot tools: registered at start, reads answered from the daemon without a prompt', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  expect(registeredTools).toEqual(['status', 'logs', 'incidents', 'diagnose', 'metrics', 'start', 'restart', 'stop', 'run_task'])
+
+  const st: any = await $.tool.call({ tool: 'mcp__devpilot-panel__status' } as any)
+  expect(st.result.workspaces[0].services.map((r: any) => r.name)).toEqual(['api', 'worker', 'web'])
+  const logs: any = await $.tool.call({ tool: 'mcp__devpilot-panel__logs', service: 'api', tail: 20 } as any)
+  expect(logs.result.lines).toEqual(['listening on 4510', 'ERR warn: slow query'])
+
+  posts.length = 0
+  const started: any = await $.tool.call({ tool: 'mcp__devpilot-panel__restart', service: 'web' } as any)
+  expect(started.result.ok).toBe(true)
+  expect(posts).toEqual(['/api/services/demo-abc123/web/restart'])
+
+  expect((await $.tool.check({ tool: 'mcp__devpilot-panel__logs', input: { service: 'api' } } as any)).decision).toBe('allow')
+  expect((await $.tool.check({ tool: 'mcp__devpilot-panel__start', input: { service: 'api' } } as any)).decision).toBe('ask')
+  expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' } } as any)).decision).toBe('allow')
+})
+
+test('DevPilot tools with the daemon down: a clear error, nothing else', async ($, on) => {
+  engine(on, { daemonUp: false })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  expect(said(await $.tool.call({ tool: 'mcp__devpilot-panel__status' } as any))).toMatch(/daemon is not running/)
+})
+
+test('the diagnoser agent stays read-only', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'services', args: '' })
+  const asAgent = (command: string) => $.tool.call({ tool: 'Bash', command, agentId: 'diag-1' } as any)
+  for (const command of ['devpilot diagnose api --json', 'devpilot logs api -n 300 --grep Error --json', 'git log -5 --oneline -- src', 'cd backend && grep -rn timeout src 2>/dev/null']) {
+    expect(said(await asAgent(command))).toBe('')
+  }
+  expect(said(await asAgent('devpilot restart api --wait --json'))).toMatch(/read-only/)
+  expect(said(await asAgent('devpilot incidents clear'))).toMatch(/read-only/)
+  expect(said(await asAgent('devpilot env api --reveal'))).toMatch(/read-only/)
+  expect(said(await asAgent('cat backend/.env'))).toMatch(/\.env file/)
+  expect(said(await asAgent('echo fix > src/a.ts'))).toMatch(/writes to a file/)
+  expect(said(await asAgent('yarn install'))).toMatch(/read-only/)
+  expect(said(await $.tool.call({ tool: 'mcp__devpilot-panel__restart', service: 'api', agentId: 'diag-1' } as any))).toMatch(/read-only/)
+  // The main loop is not the agent: the same command passes the read-only check.
+  expect(said(await $.tool.call({ tool: 'Bash', command: 'yarn install' }))).toBe('')
+})
+
+test('the pane charts the workspace CPU and memory of the last 15 minutes', async ($, on) => {
+  engine(on, { daemonUp: true, pref: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'services', args: '' }) // hidden
+  await $.command.run({ command: 'services', args: '' }) // shown again: polls with the pane open
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: /RESOURCES · 15 MIN/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^12\.5%$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /^350 MB$/ })).toBeTruthy()
+    expect(await ui.find({ type: 'Text', text: /Top: api 1% · 64 MB/ })).toBeTruthy()
+    // A chart where the surface draws Svg, block characters where it does not.
+    const svgs = await ui.findAll({ type: 'Svg' })
+    const chart = svgs.some((x) => x.props.alt === 'CPU 12.5%') || !!(await ui.find({ type: 'Text', text: /^[▁▂▃▄▅▆▇█]{3}$/ }))
+    expect(chart).toBe(true)
+    await ui.unmount()
+  }
 })

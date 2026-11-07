@@ -1,5 +1,6 @@
 // HTTP API + SSE + dashboard, served on 127.0.0.1 only.
 import fs from 'node:fs';
+import { CONFIG_HELP } from '../cli/help.js';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { Hono, type Context } from 'hono';
@@ -356,7 +357,7 @@ export function createApp({ sup, token, startedAt, dashboardDir, shutdown }: App
     if (!root || !fs.existsSync(root)) return c.json({ error: `folder not found: ${root}` }, 400);
     const services = detectServices(root);
     const existing = CONFIG_FILES.map((f) => path.join(root, f)).find((f) => fs.existsSync(f)) || null;
-    return c.json({ services, yaml: draftYaml(root, services), existing });
+    return c.json({ services, yaml: draftYaml(root, services), existing, reference: CONFIG_HELP });
   });
 
   // ---------------------------------------------------------------- SSE

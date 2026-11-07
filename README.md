@@ -14,8 +14,11 @@ Claude desktop. Penerus jsrunner yang lebih lengkap.
   alarm memori, dan deteksi konflik port.
 - **Dependency & env**: `depends_on` menunggu readiness (service yang menunggu tampil sebagai *queued*),
   profile service, dan env profile (`.env.staging`, …).
-- **Integrasi Claude lewat CLI**: semua perintah `devpilot … --json`; skill untuk setup, diagnose, up/status/logs;
-  hook SessionStart memberi Claude ringkasan status; *monitor* mengirim notifikasi crash ke sesi.
+- **Integrasi Claude lewat tool native** (`mcp__devpilot-panel__*`, dari plugin `devpilot-panel`): status, logs,
+  incidents, diagnose, up/start/restart/stop, run_task, mode, env, ports, setup; Claude tidak memakai CLI lewat Bash
+  (perintah `devpilot …` di Bash ditolak dan diarahkan ke tool-nya). Skill untuk setup, diagnose, up/status/logs;
+  agent read-only `devpilot:diagnoser`; hook SessionStart memberi Claude ringkasan status; *monitor* mengirim
+  notifikasi crash ke sesi.
   Claude menawarkan diagnosis dan **tidak** mengubah kode tanpa diminta.
 - **Web dashboard** (`devpilot open`): overview, graf dependency, grafik CPU/RAM/latency, log live, incident,
   diagnose, env, dan port map.
@@ -23,10 +26,10 @@ Claude desktop. Penerus jsrunner yang lebih lengkap.
   *Ask Claude* dan *Logs*, layer Infra / Core services / BFF / Frontend, serta Start/Stop per service.
 
 ```
-Claude ──Bash──► devpilot CLI ─┐
-Monitor (devpilot watch) ──────┤
-Panel mod ($.http.fetch) ──────┼──HTTP 127.0.0.1 + token──► devpilotd ──► service (file stdout/stderr)
-Dashboard (browser, SSE) ──────┘
+Claude ──tool──► panel mod ($.http.fetch) ─┐
+Monitor (devpilot watch) ───────────────────┤
+CLI (untuk manusia di terminal) ────────────┼──HTTP 127.0.0.1 + token──► devpilotd ──► service (file stdout/stderr)
+Dashboard (browser, SSE) ───────────────────┘
 ```
 
 ## Instalasi
@@ -146,9 +149,13 @@ Setelah memperbarui plugin, jalankan `/reload-plugins`.
   bisa mengubah sesuatu (restart, install, menulis file, membuka `.env`, `--reveal`).
 - **Grafik resource.** Panel menampilkan CPU dan memori workspace selama 15 menit terakhir (garis di desktop,
   karakter blok di terminal) plus tiga service yang paling banyak memakai memori.
-- **Tool DevPilot untuk Claude.** Panel mendaftarkan `mcp__devpilot-panel__status`, `logs`, `incidents`,
-  `diagnose`, `metrics` (tanpa permintaan izin, hanya membaca) serta `start`, `restart`, `stop`, `run_task`
-  (tetap meminta izin). CLI `devpilot … --json` tetap berlaku; tool ini hanya jalan pintas tanpa shell.
+- **Tool DevPilot untuk Claude.** Panel mendaftarkan 23 tool `mcp__devpilot-panel__*`. Yang hanya membaca
+  (`status`, `logs`, `incidents`, `diagnose`, `metrics`, `env`, `ports`, `tasks`, `detect`, `open_dashboard`)
+  jalan tanpa permintaan izin; yang mengubah sesuatu (`up`, `down`, `start`, `restart`, `stop`, `run_task`,
+  `set_mode`, `set_env`, `clear_incidents`, `kill_port`, `register`, `unregister`, `daemon`) tetap meminta izin.
+  Tool menyalakan daemon bila belum jalan dan mendaftarkan `devpilot.yaml` proyek saat pertama dipakai.
+  Claude tidak memakai CLI: perintah `devpilot …` di Bash ditolak dengan nama tool penggantinya. CLI tetap ada
+  untuk dipakai manusia di terminal.
 
 ## devpilot.yaml
 

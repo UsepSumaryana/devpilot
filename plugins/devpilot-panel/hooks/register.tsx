@@ -30,6 +30,10 @@ type Daemon = { port: number; token: string }
 const LIVE = ['running', 'starting', 'unhealthy', 'backoff']
 const FAILING = ['crashed', 'backoff', 'unhealthy']
 
+/** A DevPilot tool as the model calls it. */
+const TOOL_PREFIX = 'mcp__devpilot-panel__'
+const toolName = (n: string) => TOOL_PREFIX + n
+
 const join = (...parts: string[]) => parts.join('/').replace(/[\\/]+/g, '/')
 
 // ------------------------------------------------------------- daemon access
@@ -283,13 +287,14 @@ async function openDashboard($: EngineInterface, route = '') {
 
 const CONFIG_FILES = ['devpilot.yaml', 'devpilot.yml', '.devpilot.yaml']
 
-async function hasConfig($: EngineInterface, dir: string): Promise<boolean> {
+/** The devpilot.yaml of `dir` or its nearest parent that has one. */
+async function findConfig($: EngineInterface, dir: string): Promise<string | null> {
   let d = dir.replace(/\\/g, '/').replace(/\/+$/, '')
   for (let i = 0; i < 40 && d; i++) {
     for (const f of CONFIG_FILES) {
       try {
         await $.fs.read(`${d}/${f}`)
-        return true
+        return `${d}/${f}`
       } catch {
         /* not here */
       }
@@ -298,8 +303,10 @@ async function hasConfig($: EngineInterface, dir: string): Promise<boolean> {
     if (!up || up === d || /^[A-Za-z]:$/.test(d)) break
     d = up
   }
-  return false
+  return null
 }
+
+const hasConfig = async ($: EngineInterface, dir: string) => (await findConfig($, dir)) !== null
 
 /** The person's last choice, remembered across sessions: open or not. */
 async function rememberOpen($: EngineInterface, open: boolean) {
@@ -514,10 +521,10 @@ function barSvg(services: Row[], widthPx: number): string {
 }
 
 const diagnosePrompt = (r: Row) =>
-  `DevPilot service ${r.key} is ${r.status}${r.lastError ? ` (${r.lastError})` : ''}. Diagnose it with the devpilot:diagnoser agent (read-only; it starts from \`devpilot diagnose ${r.key} --json\`) and propose a fix — don't change anything yet.`
+  `DevPilot service ${r.key} is ${r.status}${r.lastError ? ` (${r.lastError})` : ''}. Diagnose it with the devpilot:diagnoser agent (read-only; it starts from the ${toolName('diagnose')} tool) and propose a fix — don't change anything yet.`
 
 const triagePrompt = (w: Ws) =>
-  `Summarise the open DevPilot incidents of workspace ${w.id} (\`devpilot incidents --open --ws ${w.id} --json\`), most important first, and say which need action. Don't change anything.`
+  `Summarise the open DevPilot incidents of workspace ${w.name} (the ${toolName('incidents')} tool, open: true), most important first, and say which need action. Don't change anything.`
 
 // ------------------------------------------------------------ resources
 const fmtMem = (bytes: number) => (bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB` : `${Math.round(bytes / 1024 ** 2)} MB`)
@@ -575,42 +582,175 @@ function readOnlyCommand(command: string): string | null {
 }
 
 // ---------------------------------------------------------- model tools
-// The devpilot CLI's main verbs as tools of their own: no shell, no quoting, structured answers.
-type ToolDef = { name: string; description: string; read: boolean; inputSchema: Record<string, unknown> }
+// Everything the devpilot CLI does, as tools of their own: Claude drives DevPilot through these,
+// never through Bash (a `devpilot …` command is refused with the tool to use instead).
+type ToolDef = { name: string; description: string; read: boolean; eager?: boolean; inputSchema: Record<string, unknown> }
 const svcProp = { type: 'string', description: 'Service name in this project (e.g. "api"), or "<workspace>/<service>"' }
+const listProp = { type: 'array', items: { type: 'string' } }
+const wsProp = { type: 'string', description: 'Workspace id or name (see status with all: true); default the session folder\'s project' }
+const obj = (properties: Record<string, unknown>, required: string[] = []) => ({ type: 'object', properties, ...(required.length ? { required } : {}) })
 const TOOLS: ToolDef[] = [
-  { name: 'status', read: true, description: 'DevPilot: the services of this project (or one service, or every workspace) — state, health, port, CPU/memory, restarts, open incidents, mode.', inputSchema: { type: 'object', properties: { service: { ...svcProp, description: 'One service; omit for the whole workspace' }, all: { type: 'boolean', description: 'Every registered workspace' } } } },
-  { name: 'logs', read: true, description: 'DevPilot: log lines of a service (stdout, stderr, and DevPilot\'s own lines), newest last.', inputSchema: { type: 'object', properties: { service: svcProp, tail: { type: 'number', description: 'How many lines (default 100, at most 1000)' }, grep: { type: 'string', description: 'Regex the lines must match' }, since: { type: 'string', description: 'Only lines newer than this, e.g. "5m", "1h"' }, stream: { type: 'string', enum: ['out', 'err', 'sys'] } }, required: ['service'] } },
-  { name: 'incidents', read: true, description: 'DevPilot: crashes, failed starts, health failures, memory alarms and error bursts of this project (or one service).', inputSchema: { type: 'object', properties: { service: svcProp, open: { type: 'boolean', description: 'Only unresolved ones' }, since: { type: 'string', description: 'e.g. "1h"' } } } },
-  { name: 'diagnose', read: true, description: 'DevPilot: triage report of a service — verdict, findings with suggestions, the last error block, dependencies, port holder, missing env.', inputSchema: { type: 'object', properties: { service: svcProp }, required: ['service'] } },
-  { name: 'metrics', read: true, description: 'DevPilot: CPU (percent of the machine), memory (bytes) and health latency history of a service.', inputSchema: { type: 'object', properties: { service: svcProp, range: { type: 'string', enum: ['15m', '1h', '24h'] } }, required: ['service'] } },
-  { name: 'start', read: false, description: 'DevPilot: start a service in the background (dependencies first, its mode\'s tasks included) and wait until it is ready; returns the reason and last log lines on failure.', inputSchema: { type: 'object', properties: { service: svcProp, mode: { type: 'string', description: 'Run in this mode (e.g. "build"); omit for its current one' }, wait: { type: 'boolean', description: 'Wait until ready (default true)' } }, required: ['service'] } },
-  { name: 'restart', read: false, description: 'DevPilot: restart a service and wait until it is ready again; use after a fix to verify it.', inputSchema: { type: 'object', properties: { service: svcProp, wait: { type: 'boolean', description: 'Wait until ready (default true)' } }, required: ['service'] } },
-  { name: 'stop', read: false, description: 'DevPilot: stop a service (its process tree).', inputSchema: { type: 'object', properties: { service: svcProp }, required: ['service'] } },
-  { name: 'run_task', read: false, description: 'DevPilot: run a one-shot task from devpilot.yaml (install, build, migrate...) of the workspace or of one service, and wait for it; returns its status and last output lines.', inputSchema: { type: 'object', properties: { task: { type: 'string' }, service: { ...svcProp, description: 'The service whose task it is; omit for a workspace task' } }, required: ['task'] } },
+  { name: 'status', read: true, eager: true, description: 'DevPilot: the services of this project (or one service, or every workspace): state, health, port and URL, CPU/memory, restarts, open incidents, mode, run command. Registers the project on first use when it has a devpilot.yaml.', inputSchema: obj({ workspace: wsProp, service: { ...svcProp, description: 'One service; omit for the whole workspace' }, all: { type: 'boolean', description: 'Every registered workspace' } }) },
+  { name: 'logs', read: true, eager: true, description: 'DevPilot: log lines of a service (stdout, stderr marked ERR, DevPilot\'s own marked SYS), newest last.', inputSchema: obj({ service: svcProp, tail: { type: 'number', description: 'How many lines (default 100, at most 1000)' }, grep: { type: 'string', description: 'Regex the lines must match' }, since: { type: 'string', description: 'Only lines newer than this, e.g. "5m", "1h"' }, stream: { type: 'string', enum: ['out', 'err', 'sys'] } }, ['service']) },
+  { name: 'incidents', read: true, description: 'DevPilot: crashes, failed starts, failed tasks, health failures, memory alarms and error bursts of this project (or one service).', inputSchema: obj({ workspace: wsProp, service: svcProp, open: { type: 'boolean', description: 'Only unresolved ones' }, since: { type: 'string', description: 'e.g. "1h"' }, all: { type: 'boolean', description: 'Every workspace' } }) },
+  { name: 'diagnose', read: true, eager: true, description: 'DevPilot: triage report of a service: verdict, findings with suggestions, the last error block, dependencies, port holder, missing env, last incident.', inputSchema: obj({ service: svcProp }, ['service']) },
+  { name: 'metrics', read: true, description: 'DevPilot: CPU (percent of the machine), memory (bytes) and health latency history of a service.', inputSchema: obj({ service: svcProp, range: { type: 'string', enum: ['15m', '1h', '24h'] } }, ['service']) },
+  { name: 'env', read: true, description: 'DevPilot: the environment a service runs with (secret values masked) and its env files.', inputSchema: obj({ service: svcProp }, ['service']) },
+  { name: 'ports', read: true, description: 'DevPilot: which process listens on which port, and which service it belongs to or is configured for.', inputSchema: obj({}) },
+  { name: 'tasks', read: true, description: 'DevPilot: the one-shot tasks (install, build, migrate...) the workspace and its services define, and recent task runs.', inputSchema: obj({ workspace: wsProp,}) },
+  { name: 'detect', read: true, description: 'DevPilot: detect the services of a folder (Node, Python, Go, Java, Rust, .NET, Docker Compose, Procfile) and draft a devpilot.yaml. Writes nothing: write the file yourself after the user agreed, then call register.', inputSchema: obj({ path: { type: 'string', description: 'Folder; default the session folder' } }) },
+  { name: 'open_dashboard', read: true, description: 'DevPilot: open the web dashboard in the user\'s browser, logged in (optionally at a service\'s logs).', inputSchema: obj({ service: svcProp }) },
+  { name: 'up', read: false, eager: true, description: 'DevPilot: start a profile (default "default") or some services, dependencies first, and wait until ready; failures come with reason, suggestion and last log lines.', inputSchema: obj({ workspace: wsProp, profile: { type: 'string' }, services: { ...listProp, description: 'Service names instead of a profile' }, mode: { type: 'string', description: 'Switch the workspace to this mode first' }, wait: { type: 'boolean', description: 'Wait until ready (default true)' } }) },
+  { name: 'down', read: false, description: 'DevPilot: stop the whole workspace (dependents first), or the given services.', inputSchema: obj({ workspace: wsProp, services: listProp }) },
+  { name: 'start', read: false, eager: true, description: 'DevPilot: start a service in the background (dependencies first, its mode\'s tasks included) and wait until it is ready; returns reason, suggestion and last log lines on failure.', inputSchema: obj({ service: svcProp, mode: { type: 'string', description: 'Run in this mode (e.g. "build")' }, wait: { type: 'boolean', description: 'Wait until ready (default true)' }, deps: { type: 'boolean', description: 'Start dependencies first (default true)' } }, ['service']) },
+  { name: 'restart', read: false, eager: true, description: 'DevPilot: restart a service and wait until it is ready again; use after a fix to verify it.', inputSchema: obj({ service: svcProp, wait: { type: 'boolean', description: 'Wait until ready (default true)' } }, ['service']) },
+  { name: 'stop', read: false, description: 'DevPilot: stop a service (its process tree).', inputSchema: obj({ service: svcProp }, ['service']) },
+  { name: 'run_task', read: false, description: 'DevPilot: run a one-shot task from devpilot.yaml (install, build, migrate...) and wait for it: of the workspace, of one service, or of every service that defines it (one after another). Its output lands in the service log the user watches.', inputSchema: obj({ workspace: wsProp, task: { type: 'string' }, service: { ...svcProp, description: 'Whose task; omit for a workspace task' }, all: { type: 'boolean', description: 'Every service that defines the task' } }, ['task']) },
+  { name: 'set_mode', read: false, description: 'DevPilot: switch how services run (e.g. "build" = built output instead of watch mode; "default" = the plain config), for the workspace or some services; restart: true restarts the running ones.', inputSchema: obj({ workspace: wsProp, mode: { type: 'string' }, services: listProp, restart: { type: 'boolean' } }, ['mode']) },
+  { name: 'set_env', read: false, description: 'DevPilot: switch the workspace env profile (empty for none); restart: true restarts the running services.', inputSchema: obj({ workspace: wsProp, profile: { type: 'string' }, restart: { type: 'boolean' } }, ['profile']) },
+  { name: 'clear_incidents', read: false, description: 'DevPilot: mark incidents resolved, of one service or of the whole workspace.', inputSchema: obj({ workspace: wsProp, service: svcProp }) },
+  { name: 'kill_port', read: false, description: 'DevPilot: kill the process holding a port. Only after the user agreed to stop that process: call ports first, show them its name and command, and pass its pid here.', inputSchema: obj({ port: { type: 'number' }, pid: { type: 'number', description: 'The pid the user agreed to stop; refused if the port is held by another' } }, ['port', 'pid']) },
+  { name: 'register', read: false, description: 'DevPilot: register a workspace from its devpilot.yaml (the session folder\'s by default); the daemon then supervises its services and reloads the file on change.', inputSchema: obj({ path: { type: 'string', description: 'devpilot.yaml or its folder' } }) },
+  { name: 'unregister', read: false, description: 'DevPilot: remove a workspace (stops its services).', inputSchema: obj({ workspace: { type: 'string', description: 'Workspace id; default this project\'s' } }) },
+  { name: 'daemon', read: false, description: 'DevPilot: start, restart or stop the background daemon. Services keep running through a restart; stop keeps them only with keep_services.', inputSchema: obj({ action: { type: 'string', enum: ['start', 'restart', 'stop'] }, keep_services: { type: 'boolean' } }, ['action']) },
 ]
-const TOOL_PREFIX = 'mcp__devpilot-panel__'
 
 const sinceMs = (s: unknown): number | null => {
   const m = typeof s === 'string' ? /^(\d+)\s*(s|m|h|d)$/.exec(s.trim()) : null
   return m ? Date.now() - Number(m[1]) * { s: 1e3, m: 6e4, h: 36e5, d: 864e5 }[m[2] as 's'] : null
 }
 
+/** Runs the devpilot CLI the plugin installed (`~/.devpilot/install.json`): only for the daemon's own lifecycle. */
+async function runCli($: EngineInterface, argv: string[], timeoutMs = 30_000): Promise<string> {
+  let info: { node: string; cli: string }
+  try {
+    info = JSON.parse(await $.fs.read(join(await home($), 'install.json')))
+  } catch {
+    throw new Error('DevPilot is not set up on this machine yet (no ~/.devpilot/install.json): install the devpilot plugin and reload plugins.')
+  }
+  const r = await $.process.run([info.node, info.cli, ...argv], { timeoutMs })
+  if (r.exitCode !== 0) throw new Error((r.stderr || r.stdout).trim().slice(0, 500) || `devpilot ${argv.join(' ')} failed`)
+  return r.stdout
+}
+
+const alive = ($: EngineInterface, d: Daemon) => call($, d, 'GET', '/api/ping').then(
+  () => true,
+  () => false,
+)
+
+/** The daemon, started when it is not running (as the CLI does). */
+async function ensureDaemon($: EngineInterface): Promise<Daemon> {
+  let d = await daemonInfo($)
+  if (d && (await alive($, d))) return d
+  await runCli($, ['daemon', 'start'])
+  for (let i = 0; i < 16; i++) {
+    d = await daemonInfo($)
+    if (d && (await alive($, d))) return d
+    await $.clock.sleep(250)
+  }
+  throw new Error('The DevPilot daemon did not come up; ask the user to check ~/.devpilot/daemon.log.')
+}
+
+const lastLines = (v: unknown, n: number) => (Array.isArray(v) ? v.slice(-n) : v)
+/** A daemon suggestion like "devpilot start party" read as the tool that does it. */
+const asTool = (text: unknown) =>
+  typeof text === 'string'
+    ? text.replace(/`?devpilot\s+([^`]+?)`?(?=$|[.;,)])/g, (whole: string, args: string) => {
+        const tool = toolForCli(args)
+        const rest = args.trim().split(/\s+/).slice(1).filter((a) => !a.startsWith('-')).join(' ')
+        return tool ? `${toolName(tool)}${rest ? ` (${rest})` : ''}` : whole
+      })
+    : text
+const briefIncident = (i: any, lines = 0) => {
+  const { context, ...rest } = i ?? {}
+  return lines ? { ...rest, context: lastLines(context, lines) } : rest
+}
+const briefService = (s: any) => ({
+  key: s.key,
+  name: s.name,
+  status: s.status,
+  mode: s.mode,
+  modes: s.modes,
+  port: s.port,
+  url: s.url,
+  health: s.health?.state,
+  latencyMs: s.health?.latencyMs,
+  cpu: s.cpu,
+  memMb: typeof s.mem === 'number' ? Math.round(s.mem / 1048576) : undefined,
+  restarts: s.restarts,
+  exitCode: s.exitCode,
+  lastError: typeof s.lastError === 'string' ? s.lastError.slice(0, 300) : undefined,
+  openIncidents: s.openIncidents,
+  dependsOn: s.dependsOn,
+  queued: s.queued || undefined,
+  task: s.task,
+  tasks: s.tasks,
+})
+const briefSummary = (sum: any) => ({
+  daemon: { version: sum.version, startedAt: sum.startedAt },
+  workspaces: (sum.workspaces || []).map((w: any) => ({
+    id: w.id,
+    name: w.name,
+    root: w.root,
+    profiles: Object.keys(w.profiles || {}),
+    envProfile: w.envProfile ?? null,
+    envProfiles: w.envProfiles,
+    mode: w.mode,
+    modes: w.modes,
+    tasks: w.tasks,
+    error: w.error,
+    services: (w.services || []).map(briefService),
+  })),
+  incidents: (sum.incidents || []).map((i: any) => briefIncident(i)),
+})
+const briefDiagnosis = (d: any) => ({
+  ...d,
+  findings: (d.findings || []).map((f: any) => ({ ...f, suggestion: asTool(f.suggestion) })),
+  lastIncident: d.lastIncident ? briefIncident(d.lastIncident) : d.lastIncident,
+  errorBlock: lastLines(d.errorBlock, 30),
+  recentLogs: lastLines(d.recentLogs, 15),
+})
+
 async function serveTool($: EngineInterface, name: string, input: Record<string, unknown>): Promise<unknown> {
-  const d = await daemonInfo($)
-  if (!d) throw new Error('The DevPilot daemon is not running. Start it with `devpilot daemon start` (or `devpilot up`).')
+  const d = await ensureDaemon($)
   const here = cwd || (await $.session.cwd())
+  /** This project's workspace, registered on first use when it has a devpilot.yaml (as the CLI does). */
+  const wsHere = async (): Promise<string | null> => {
+    if (typeof input.workspace === 'string' && input.workspace.trim()) {
+      const want = input.workspace.trim()
+      const list = (await call($, d, 'GET', '/api/workspaces')) as any[]
+      const hit = list.find((w) => w.id === want) ?? list.find((w) => String(w.name).toLowerCase() === want.toLowerCase())
+      if (!hit) throw new Error(`No workspace "${want}". Registered: ${list.map((w) => `${w.name} (${w.id})`).join(', ') || 'none'}.`)
+      return hit.id as string
+    }
+    const r = await call($, d, 'GET', `/api/resolve?cwd=${encodeURIComponent(here)}`)
+    if (r.workspace) return r.workspace as string
+    const cfg = await findConfig($, here)
+    if (!cfg) return null
+    const w = await call($, d, 'POST', '/api/workspaces', { path: cfg })
+    resolvedOnce = false
+    return w.id as string
+  }
+  const needWs = async () => {
+    const ws = await wsHere()
+    if (!ws) throw new Error(`No devpilot.yaml in ${here} or its parents: pass \`workspace\` (see status with all: true), or use the detect tool to draft one.`)
+    return ws
+  }
   const keyOf = async (ref: unknown) => {
     if (typeof ref !== 'string' || !ref.trim()) throw new Error('Which service? Pass `service` (see the status tool).')
+    if (!ref.includes('/')) {
+      const ws = await wsHere()
+      if (ws && typeof input.workspace === 'string' && input.workspace.trim()) return `${ws}/${ref.trim()}`
+    }
     return String((await call($, d, 'GET', `/api/resolve?ref=${encodeURIComponent(ref.trim())}&cwd=${encodeURIComponent(here)}`)).key)
   }
-  const wsHere = async () => (await call($, d, 'GET', `/api/resolve?cwd=${encodeURIComponent(here)}`)).workspace as string | null
   const svc = (k: string) => `/api/services/${k}`
+  const names = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && !!x) : [])
   switch (name) {
     case 'status': {
-      if (input.service) return call($, d, 'GET', svc(await keyOf(input.service)))
+      if (input.service) return briefService(await call($, d, 'GET', svc(await keyOf(input.service))))
       const ws = input.all ? null : await wsHere()
-      return call($, d, 'GET', `/api/summary${ws ? `?ws=${ws}` : ''}`)
+      return briefSummary(await call($, d, 'GET', `/api/summary${ws ? `?ws=${ws}` : ''}`))
     }
     case 'logs': {
       const q = new URLSearchParams({ tail: String(Math.min(1000, Math.max(1, Number(input.tail) || 100))) })
@@ -624,41 +764,120 @@ async function serveTool($: EngineInterface, name: string, input: Record<string,
     case 'incidents': {
       const q = new URLSearchParams({ limit: '20' })
       if (input.service) q.set('key', await keyOf(input.service))
-      else {
+      else if (!input.all) {
         const ws = await wsHere()
         if (ws) q.set('ws', ws)
       }
       if (input.open) q.set('open', '1')
       const since = sinceMs(input.since)
       if (since) q.set('since', String(since))
-      return call($, d, 'GET', `/api/incidents?${q}`)
+      const list = await call($, d, 'GET', `/api/incidents?${q}`)
+      return Array.isArray(list) ? list.map((i) => briefIncident(i, 15)) : list
     }
     case 'diagnose':
-      return call($, d, 'GET', `${svc(await keyOf(input.service))}/diagnose`)
+      return briefDiagnosis(await call($, d, 'GET', `${svc(await keyOf(input.service))}/diagnose`))
     case 'metrics':
       return call($, d, 'GET', `${svc(await keyOf(input.service))}/metrics?range=${input.range === '1h' || input.range === '24h' ? input.range : '15m'}`)
+    case 'env':
+      return call($, d, 'GET', `${svc(await keyOf(input.service))}/env`)
+    case 'ports':
+      return call($, d, 'GET', '/api/ports')
+    case 'tasks':
+      return call($, d, 'GET', `/api/workspaces/${await needWs()}/tasks`)
+    case 'detect': {
+      const dir = typeof input.path === 'string' && input.path ? resolveDir(here, input.path) : here
+      return call($, d, 'POST', '/api/detect', { path: dir })
+    }
+    case 'open_dashboard': {
+      await openDashboard($, input.service ? `/service/${await keyOf(input.service)}/logs` : '')
+      return { opened: true }
+    }
+    case 'up': {
+      const ws = await needWs()
+      const services = names(input.services)
+      return call($, d, 'POST', `/api/workspaces/${ws}/up`, { profile: typeof input.profile === 'string' ? input.profile : undefined, services: services.length ? services : undefined, wait: input.wait !== false, mode: typeof input.mode === 'string' ? input.mode : undefined })
+    }
+    case 'down': {
+      const services = names(input.services)
+      if (!services.length) return call($, d, 'POST', `/api/workspaces/${await needWs()}/down`, {})
+      const out = []
+      for (const s of services) out.push(await call($, d, 'POST', `${svc(await keyOf(s))}/stop`, {}))
+      return out
+    }
     case 'start':
-      return call($, d, 'POST', `${svc(await keyOf(input.service))}/start`, { wait: input.wait !== false, deps: true, mode: typeof input.mode === 'string' ? input.mode : undefined })
+      return call($, d, 'POST', `${svc(await keyOf(input.service))}/start`, { wait: input.wait !== false, deps: input.deps !== false, mode: typeof input.mode === 'string' ? input.mode : undefined })
     case 'restart':
       return call($, d, 'POST', `${svc(await keyOf(input.service))}/restart`, { wait: input.wait !== false })
     case 'stop':
       return call($, d, 'POST', `${svc(await keyOf(input.service))}/stop`, {})
     case 'run_task': {
-      if (typeof input.task !== 'string' || !input.task) throw new Error('Which task? Pass `task`.')
+      if (typeof input.task !== 'string' || !input.task) throw new Error('Which task? Pass `task` (see the tasks tool).')
       const key = input.service ? await keyOf(input.service) : null
-      const ws = key ? key.split('/')[0]! : await wsHere()
-      if (!ws) throw new Error('This folder is not a DevPilot workspace.')
-      let run = await call($, d, 'POST', `/api/workspaces/${ws}/tasks`, { task: input.task, service: key ? key.split('/')[1] : undefined })
-      const until = Date.now() + 30 * 60_000
-      while (run?.status === 'running' && Date.now() < until) {
-        await $.clock.sleep(1000)
-        run = await call($, d, 'GET', `/api/tasks/${run.id}`)
-      }
+      const ws = key ? key.split('/')[0]! : await needWs()
+      // The daemon waits for the task: no polling here.
+      const run = await call($, d, 'POST', `/api/workspaces/${ws}/tasks`, { task: input.task, service: key ? key.split('/')[1] : undefined, all: input.all === true || undefined, wait: true })
+      if (Array.isArray(run)) return run
       const logs = run?.logKey ? await call($, d, 'GET', `/api/services/${run.logKey}/logs?tail=40`).catch(() => null) : null
       return { ...run, output: (logs?.lines || []).map((l: any) => l.text) }
     }
+    case 'set_mode': {
+      const services = names(input.services)
+      return call($, d, 'POST', `/api/workspaces/${await needWs()}/mode`, { mode: input.mode, services: services.length ? services : undefined, restart: input.restart === true })
+    }
+    case 'set_env':
+      return call($, d, 'POST', `/api/workspaces/${await needWs()}/env`, { profile: typeof input.profile === 'string' && input.profile ? input.profile : null, restart: input.restart === true })
+    case 'clear_incidents':
+      return call($, d, 'POST', '/api/incidents/resolve', input.service ? { key: await keyOf(input.service) } : { ws: await needWs() })
+    case 'kill_port': {
+      const port = Number(input.port)
+      const row = ((await call($, d, 'GET', '/api/ports')) as any[]).find((p) => p.port === port)
+      if (!row) throw new Error(`Nothing listens on port ${port}.`)
+      if (row.pid !== Number(input.pid)) throw new Error(`Port ${port} is held by pid ${row.pid} (${row.name}: ${String(row.cmd).slice(0, 160)}), not ${input.pid}. Show the user and call again with that pid once they agreed.`)
+      return call($, d, 'POST', `/api/ports/${port}/kill`, { force: true })
+    }
+    case 'register': {
+      const given = typeof input.path === 'string' && input.path ? resolveDir(here, input.path) : here
+      const cfg = /\.ya?ml$/i.test(given) ? given : await findConfig($, given)
+      if (!cfg) throw new Error(`No devpilot.yaml in ${given} or its parents.`)
+      resolvedOnce = false
+      return call($, d, 'POST', '/api/workspaces', { path: cfg })
+    }
+    case 'unregister': {
+      const ws = typeof input.workspace === 'string' && input.workspace ? input.workspace : await needWs()
+      resolvedOnce = false
+      return call($, d, 'DELETE', `/api/workspaces/${ws}`)
+    }
+    case 'daemon': {
+      const action = String(input.action)
+      if (!['start', 'restart', 'stop'].includes(action)) throw new Error('action is start, restart or stop')
+      return { output: (await runCli($, ['daemon', action, ...(input.keep_services ? ['--keep-services'] : [])], 60_000)).trim() }
+    }
   }
   throw new Error(`Unknown DevPilot tool ${name}`)
+}
+
+/** The tool a `devpilot <verb> …` command maps to, for steering Claude off the CLI. */
+function toolForCli(args: string): string | null {
+  const [verb = '', sub = ''] = args.trim().split(/\s+/)
+  const table: Record<string, string> = { status: 'status', ps: 'status', st: 'status', ls: 'status', logs: 'logs', log: 'logs', diagnose: 'diagnose', diag: 'diagnose', doctor: 'diagnose', metrics: 'metrics', up: 'up', down: 'down', start: 'start', stop: 'stop', restart: 'restart', register: 'register', unregister: 'unregister', daemon: 'daemon', open: 'open_dashboard', init: 'detect' }
+  if (verb === 'incidents') return sub === 'clear' ? 'clear_incidents' : 'incidents'
+  if (verb === 'env') return sub === 'use' ? 'set_env' : 'env'
+  if (verb === 'ports') return sub === 'kill' ? 'kill_port' : 'ports'
+  if (verb === 'task') return sub === 'run' ? 'run_task' : 'tasks'
+  if (verb === 'mode') return sub === 'use' || sub === 'reset' ? 'set_mode' : 'status'
+  return table[verb] ?? null
+}
+
+/** A Bash command that runs the devpilot CLI (directly, through npx, or its cli.js), and the tool for it. */
+function cliCall(command: string): { tool: string; segment: string } | null {
+  for (const part of command.split(/&&|\|\||;|\||\n/)) {
+    const seg = part.trim()
+    const m = /^(?:npx\s+)?(?:devpilot(?:\.cmd)?|node\s+\S*devpilot\S*[\\/]dist[\\/]cli\.js)\s+(.*)$/.exec(seg)
+    if (!m) continue
+    const tool = toolForCli(m[1]!)
+    if (tool) return { tool, segment: seg }
+  }
+  return null
 }
 
 // ------------------------------------------------------- incident cards
@@ -701,7 +920,7 @@ async function setStep($: EngineInterface, id: string, step: Card['step']) {
 }
 
 const cardPrompt = (c: Card) =>
-  `DevPilot service ${c.key} had an incident: ${c.title}${c.exitCode !== null ? ` (exit code ${c.exitCode})` : ''}. Diagnose it with the devpilot:diagnoser agent (read-only; it starts from \`devpilot diagnose ${c.key} --json\`) and propose a fix — don't change anything yet.`
+  `DevPilot service ${c.key} had an incident: ${c.title}${c.exitCode !== null ? ` (exit code ${c.exitCode})` : ''}. Diagnose it with the devpilot:diagnoser agent (read-only; it starts from the ${toolName('diagnose')} tool) and propose a fix — don't change anything yet.`
 
 // ------------------------------------------------- guard and code changes
 // Claude starting a managed service itself (`yarn start:dev` in its folder) blocks the turn and
@@ -778,8 +997,8 @@ function guardText(h: Hit, wsName: string): string {
   const { row } = h
   const port = row.port ? `, port ${row.port}` : ''
   if (LIVE.includes(row.status))
-    return `DevPilot already runs "${row.name}" (${row.key}${port}, ${row.status}) with this command. Running it again here would block this turn and clash with the running one. Use \`devpilot logs ${row.key} --json\` to read its output, or \`devpilot restart ${row.key} --wait --json\` to restart it.`
-  return `"${row.name}" is managed by DevPilot (workspace ${wsName}). Start it in the background with \`devpilot start ${row.key} --wait --json\` (dependencies and mode included), then read its output with \`devpilot logs ${row.key} --json\`. Running it here would block this turn and DevPilot would not supervise it.`
+    return `DevPilot already runs "${row.name}" (${row.key}${port}, ${row.status}) with this command. Running it again here would block this turn and clash with the running one. Read its output with the ${toolName('logs')} tool, or restart it with ${toolName('restart')} (service "${row.key}").`
+  return `"${row.name}" is managed by DevPilot (workspace ${wsName}). Start it with the ${toolName('start')} tool (service "${row.key}"; dependencies and mode included, waits until ready), then read its output with ${toolName('logs')}. Running it here would block this turn and DevPilot would not supervise it.`
 }
 
 const EDIT_TOOLS = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit']
@@ -847,9 +1066,9 @@ export const register: Register = (on) => {
     // Each name on its own: one refused name (a built-in's) must not cost the others.
     for (const t of TOOLS) {
       try {
-        await $.tool.register({ name: t.name, description: t.description, inputSchema: t.inputSchema, ...(t.name === 'status' ? { isDeferred: false } : {}) })
+        await $.tool.register({ name: t.name, description: t.description, inputSchema: t.inputSchema, isDeferred: !t.eager })
       } catch {
-        /* the CLI covers the same ground */
+        /* not available on this surface */
       }
     }
     for (const name of ['devpilot-panel', 'services', 'dp-services']) {
@@ -1003,6 +1222,9 @@ export const register: Register = (on) => {
       const why = readOnlyCommand(e.command)
       if (why) return { deny: `The DevPilot diagnoser is read-only and ${why}. Put the change or command in your report as the proposed fix instead.` }
     }
+    const viaCli = typeof e.command === 'string' ? cliCall(e.command) : null
+    if (viaCli)
+      return { deny: `DevPilot is driven through its tools in this session, not the CLI: use ${toolName(viaCli.tool)} for \`${viaCli.segment.slice(0, 80)}\` (load it with ToolSearch "select:${toolName(viaCli.tool)}" if it is not listed).` }
     if ((await read($, snapshot)).daemon === 'unknown') await pollOnce($).catch(() => undefined) // no poll has finished yet
     const snap = await read($, snapshot)
     if (snap.daemon !== 'up' || typeof e.command !== 'string') return next(e)
@@ -1015,13 +1237,14 @@ export const register: Register = (on) => {
 
   // The tools registered at session start: served here, against the daemon.
   for (const t of TOOLS) {
-    on('tool.call', { tool: (TOOL_PREFIX + t.name) as 'Bash' /* a registered tool's name, not a built-in's */ }, async ($, e) => {
+    on('tool.call', { tool: toolName(t.name) as 'Bash' /* a registered tool's name, not a built-in's */ }, async ($, e) => {
       if (!t.read && (await isDiagnoser($, e.agentId))) return { deny: 'The DevPilot diagnoser is read-only: propose the action in your report instead.' }
       const { tool: _t, tool_use_id: _id, consent: _c, agentId: _a, ...input } = e as unknown as Record<string, unknown>
       try {
-        const result = await serveTool($, t.name, input)
+        const data = await serveTool($, t.name, input)
         if (!t.read) void tick($)
-        return { result }
+        // A tool's result reaches the model as text (or content blocks), never as an object.
+        return { result: typeof data === 'string' ? data : JSON.stringify(data ?? null) }
       } catch (err) {
         return { deny: String((err as Error).message || err) }
       }

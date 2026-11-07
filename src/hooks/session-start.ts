@@ -28,7 +28,7 @@ async function main() {
   const info = await findDaemon();
   if (!config && !info) return; // nothing DevPilot-related here: stay silent
 
-  const hint = 'Control with the `devpilot` CLI (add --json): status, up, logs, diagnose, incidents.';
+  const hint = 'Control it with the DevPilot tools (mcp__devpilot-panel__status, up, start, restart, logs, diagnose, incidents, run_task...), not the CLI.';
   if (!info) {
     out(`DevPilot: this project has ${path.basename(config!)} but the devpilot daemon is not running, so no services are supervised. ${hint}`);
     return;
@@ -36,7 +36,7 @@ async function main() {
   const api = new Client(info);
   const r = await api.get<{ workspace: string | null }>(`/api/resolve?cwd=${encodeURIComponent(cwd)}`);
   if (!r.workspace) {
-    if (config) out(`DevPilot: ${path.basename(config)} exists here but is not registered yet (any devpilot command registers it). ${hint}`);
+    if (config) out(`DevPilot: ${path.basename(config)} exists here but is not registered yet (the DevPilot status tool registers it). ${hint}`);
     return;
   }
   const sum = await api.get<Summary>(`/api/summary?ws=${r.workspace}`);
@@ -48,7 +48,7 @@ async function main() {
       .join(', ');
     return `- ${s.name}: ${s.status}${extra ? ` (${extra})` : ''}`;
   });
-  const open = sum.incidents.length ? ` ${sum.incidents.length} open incident(s); see \`devpilot incidents --json\`.` : '';
+  const open = sum.incidents.length ? ` ${sum.incidents.length} open incident(s); see the mcp__devpilot-panel__incidents tool.` : '';
   out(`DevPilot workspace "${ws.name}" (${ws.id})${ws.envProfile ? `, env profile ${ws.envProfile}` : ''}:\n${lines.join('\n')}\n${open} ${hint}`.trim());
 }
 

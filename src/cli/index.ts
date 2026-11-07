@@ -446,7 +446,7 @@ const commands: Record<string, Handler> = {
               .join(' ⏎ ')
               .slice(0, 700);
             emit(
-              `[devpilot] ${i.severity === 'error' ? 'ERROR' : 'WARN'} ${i.key}: ${i.title}${i.count > 1 ? ` (×${i.count})` : ''}${ctx ? ` | ${ctx}` : ''} | details: devpilot diagnose ${i.key} --json`,
+              `[devpilot] ${i.severity === 'error' ? 'ERROR' : 'WARN'} ${i.key}: ${i.title}${i.count > 1 ? ` (×${i.count})` : ''}${ctx ? ` | ${ctx}` : ''} | details: mcp__devpilot-panel__diagnose (service ${i.key})`,
               { type: 'incident', incident: i },
             );
           } else if (ev.event === 'status') {

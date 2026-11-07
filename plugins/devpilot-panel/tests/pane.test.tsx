@@ -112,6 +112,22 @@ function engine(on: any, { daemonUp, project = true, pref }: { daemonUp: boolean
         ? { range: '15m', step: 10000, points: [{ t: 1, cpu: 4, mem: 300 * 1048576 }, { t: 2, cpu: 9.5, mem: 320 * 1048576 }, { t: 3, cpu: 12.5, mem: 350 * 1048576 }] }
         : url.includes('/logs')
           ? { lines: [{ seq: 1, t: 1, stream: 'out', text: 'listening on 4510' }, { seq: 2, t: 2, stream: 'err', text: 'warn: slow query' }], lastSeq: 2 }
+          : /\/api\/workspaces\/[^/]+\/tasks$/.test(url)
+            ? { id: 't1', status: 'ok', exitCode: 0, logKey: 'demo-abc123/api', task: 'install' }
+          : url.includes('/api/incidents?')
+            ? liveIncidents
+          : url.endsWith('/api/workspaces')
+            ? [{ id: 'demo-abc123', name: 'demo' }, { id: 'other-1', name: 'other' }]
+          : url.endsWith('/diagnose')
+            ? {
+                verdict: 'Dependency infra is stopped',
+                findings: [{ level: 'info', title: 'Service is stopped', suggestion: 'devpilot start party' }, { level: 'warning', title: 'Dependency infra is stopped', suggestion: 'devpilot diagnose infra' }],
+                lastIncident: { id: 'i1', title: 'crashed', context: Array.from({ length: 40 }, (_, n) => `ctx ${n}`) },
+                errorBlock: Array.from({ length: 40 }, (_, n) => `err ${n}`),
+                recentLogs: Array.from({ length: 40 }, (_, n) => `log ${n}`),
+              }
+          : url.endsWith('/api/ports')
+            ? [{ port: 4510, pid: 42, name: 'node.exe', cmd: 'node dist/main.js', service: 'demo-abc123/api' }]
           : /\/(start|restart|stop)$/.test(url)
             ? { ok: true, key: 'demo-abc123/api', status: 'running' }
             : { ...SUMMARY, incidents: [...SUMMARY.incidents, ...liveIncidents] }
@@ -254,7 +270,7 @@ test('Claude starting a running managed service by hand is refused, with the Dev
   await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
   const r: any = await $.tool.call({ tool: 'Bash', command: 'cd backend && yarn start:dev' })
   expect(String(r.deny ?? r.text)).toMatch(/already runs "api"/)
-  expect(String(r.deny ?? r.text)).toMatch(/devpilot restart demo-abc123\/api/)
+  expect(String(r.deny ?? r.text)).toMatch(/mcp__devpilot-panel__restart \(service "demo-abc123\/api"\)/)
   // Same script through another package manager, from the project root with --prefix.
   const r2: any = await $.tool.call({ tool: 'Bash', command: 'npm --prefix backend run start:dev' })
   expect(String(r2.deny ?? r2.text)).toMatch(/already runs "api"/)
@@ -264,7 +280,7 @@ test('a stopped managed service: refused, pointing at devpilot start', async ($,
   engine(on, { daemonUp: true })
   await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
   const r: any = await $.tool.call({ tool: 'Bash', command: 'cd /d/work/demo/web; yarn dev' })
-  expect(String(r.deny ?? r.text)).toMatch(/devpilot start demo-abc123\/web --wait --json/)
+  expect(String(r.deny ?? r.text)).toMatch(/mcp__devpilot-panel__start tool \(service "demo-abc123\/web"/)
 })
 
 test('other commands, and the same script in another folder, run as usual', async ($, on) => {
@@ -360,7 +376,8 @@ test('a new crash is placed as a card in the transcript; Diagnose asks Claude, R
   const card = await $.ui.mount(CARD('desktop'))
   await card.press({ key: 'card-diagnose-inc-inc_42' })
   expect(submitted).toHaveLength(1)
-  expect(submitted[0]).toMatch(/devpilot diagnose demo-abc123\/worker --json/)
+  expect(submitted[0]).toMatch(/devpilot:diagnoser agent/)
+  expect(submitted[0]).toMatch(/mcp__devpilot-panel__diagnose/)
   expect(submitted[0]).toMatch(/don't change anything yet/)
 
   posts.length = 0
@@ -401,16 +418,17 @@ const said = (r: any) => String(r.deny ?? (r.isError ? r.text : ''))
 test('DevPilot tools: registered at start, reads answered from the daemon without a prompt', async ($, on) => {
   engine(on, { daemonUp: true })
   await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
-  expect(registeredTools).toEqual(['status', 'logs', 'incidents', 'diagnose', 'metrics', 'start', 'restart', 'stop', 'run_task'])
+  expect(registeredTools).toEqual(['status', 'logs', 'incidents', 'diagnose', 'metrics', 'env', 'ports', 'tasks', 'detect', 'open_dashboard', 'up', 'down', 'start', 'restart', 'stop', 'run_task', 'set_mode', 'set_env', 'clear_incidents', 'kill_port', 'register', 'unregister', 'daemon'])
 
   const st: any = await $.tool.call({ tool: 'mcp__devpilot-panel__status' } as any)
-  expect(st.result.workspaces[0].services.map((r: any) => r.name)).toEqual(['api', 'worker', 'web'])
+  expect(typeof st.result).toBe('string') // the model reads text
+  expect(JSON.parse(st.result).workspaces[0].services.map((r: any) => r.name)).toEqual(['api', 'worker', 'web'])
   const logs: any = await $.tool.call({ tool: 'mcp__devpilot-panel__logs', service: 'api', tail: 20 } as any)
-  expect(logs.result.lines).toEqual(['listening on 4510', 'ERR warn: slow query'])
+  expect(JSON.parse(logs.result).lines).toEqual(['listening on 4510', 'ERR warn: slow query'])
 
   posts.length = 0
   const started: any = await $.tool.call({ tool: 'mcp__devpilot-panel__restart', service: 'web' } as any)
-  expect(started.result.ok).toBe(true)
+  expect(JSON.parse(started.result).ok).toBe(true)
   expect(posts).toEqual(['/api/services/demo-abc123/web/restart'])
 
   expect((await $.tool.check({ tool: 'mcp__devpilot-panel__logs', input: { service: 'api' } } as any)).decision).toBe('allow')
@@ -418,10 +436,10 @@ test('DevPilot tools: registered at start, reads answered from the daemon withou
   expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' } } as any)).decision).toBe('allow')
 })
 
-test('DevPilot tools with the daemon down: a clear error, nothing else', async ($, on) => {
+test('DevPilot tools with the daemon down and nothing installed: a clear error', async ($, on) => {
   engine(on, { daemonUp: false })
   await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
-  expect(said(await $.tool.call({ tool: 'mcp__devpilot-panel__status' } as any))).toMatch(/daemon is not running/)
+  expect(said(await $.tool.call({ tool: 'mcp__devpilot-panel__status' } as any))).toMatch(/DevPilot is not set up on this machine/)
 })
 
 test('the diagnoser agent stays read-only', async ($, on) => {
@@ -429,7 +447,7 @@ test('the diagnoser agent stays read-only', async ($, on) => {
   await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
   await $.command.run({ command: 'services', args: '' })
   const asAgent = (command: string) => $.tool.call({ tool: 'Bash', command, agentId: 'diag-1' } as any)
-  for (const command of ['devpilot diagnose api --json', 'devpilot logs api -n 300 --grep Error --json', 'git log -5 --oneline -- src', 'cd backend && grep -rn timeout src 2>/dev/null']) {
+  for (const command of ['git log -5 --oneline -- src', 'cd backend && grep -rn timeout src 2>/dev/null']) {
     expect(said(await asAgent(command))).toBe('')
   }
   expect(said(await asAgent('devpilot restart api --wait --json'))).toMatch(/read-only/)
@@ -460,4 +478,66 @@ test('the pane charts the workspace CPU and memory of the last 15 minutes', asyn
     expect(chart).toBe(true)
     await ui.unmount()
   }
+})
+
+test('the devpilot CLI through Bash is refused, naming the tool to use', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  const cases: [string, string][] = [
+    ['devpilot logs api -n 50 --json', 'logs'],
+    ['cd backend && devpilot task run install api', 'run_task'],
+    ['devpilot task --json', 'tasks'],
+    ['devpilot status --json', 'status'],
+    ['devpilot mode use build --restart', 'set_mode'],
+    ['devpilot incidents clear', 'clear_incidents'],
+    ['npx devpilot up --wait', 'up'],
+    ['devpilot.cmd ports kill 3000 --force', 'kill_port'],
+  ]
+  for (const [command, tool] of cases) expect(said(await $.tool.call({ tool: 'Bash', command }))).toMatch(new RegExp(`use mcp__devpilot-panel__${tool} for`))
+  for (const command of ['devpilot help config', 'devpilot import-jsrunner', 'echo devpilot status']) expect(said(await $.tool.call({ tool: 'Bash', command }))).toBe('')
+})
+
+test('DevPilot tools: up, run_task (waits in the daemon) and kill_port (only the agreed pid)', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  posts.length = 0
+  await $.tool.call({ tool: 'mcp__devpilot-panel__up', profile: 'backend' } as any)
+  expect(posts).toEqual(['/api/workspaces/demo-abc123/up'])
+
+  const task: any = await $.tool.call({ tool: 'mcp__devpilot-panel__run_task', task: 'install', service: 'api' } as any)
+  expect(JSON.parse(task.result)).toMatchObject({ status: 'ok', exitCode: 0, output: ['listening on 4510', 'warn: slow query'] })
+
+  expect(said(await $.tool.call({ tool: 'mcp__devpilot-panel__kill_port', port: 4510, pid: 41 } as any))).toMatch(/held by pid 42 \(node\.exe/)
+  expect(said(await $.tool.call({ tool: 'mcp__devpilot-panel__kill_port', port: 9999, pid: 1 } as any))).toMatch(/Nothing listens on port 9999/)
+  posts.length = 0
+  await $.tool.call({ tool: 'mcp__devpilot-panel__kill_port', port: 4510, pid: 42 } as any)
+  expect(posts).toEqual(['/api/ports/4510/kill'])
+})
+
+test('tool answers stay small, and daemon suggestions name tools, not the CLI', async ($, on) => {
+  engine(on, { daemonUp: true })
+  liveIncidents.push({ ...CRASH, context: Array.from({ length: 40 }, (_, n) => `line ${n}`) })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  const st = JSON.parse(((await $.tool.call({ tool: 'mcp__devpilot-panel__status' } as any)) as any).result)
+  expect(st.incidents[0].context).toBeUndefined()
+  expect(st.workspaces[0].services[0]).toMatchObject({ name: 'api', health: 'ok', memMb: 64 })
+  const inc = JSON.parse(((await $.tool.call({ tool: 'mcp__devpilot-panel__incidents', service: 'worker' } as any)) as any).result)
+  expect(inc[0].context).toHaveLength(15)
+  const dg = JSON.parse(((await $.tool.call({ tool: 'mcp__devpilot-panel__diagnose', service: 'api' } as any)) as any).result)
+  expect(dg.findings.map((f: any) => f.suggestion)).toEqual(['mcp__devpilot-panel__start (party)', 'mcp__devpilot-panel__diagnose (infra)'])
+  expect(dg.errorBlock).toHaveLength(30)
+  expect(dg.recentLogs).toHaveLength(15)
+  expect(dg.lastIncident.context).toBeUndefined()
+})
+
+test('workspace tools take a workspace by name or id from any folder', async ($, on) => {
+  engine(on, { daemonUp: true })
+  await $.session.start({ cwd: 'D:/work/demo', surface: 'desktop', isInteractive: true })
+  posts.length = 0
+  await $.tool.call({ tool: 'mcp__devpilot-panel__down', workspace: 'other' } as any)
+  expect(posts).toEqual(['/api/workspaces/other-1/down'])
+  posts.length = 0
+  await $.tool.call({ tool: 'mcp__devpilot-panel__up', workspace: 'demo-abc123', services: ['api'] } as any)
+  expect(posts).toEqual(['/api/workspaces/demo-abc123/up'])
+  expect(said(await $.tool.call({ tool: 'mcp__devpilot-panel__tasks', workspace: 'nope' } as any))).toMatch(/No workspace "nope"\. Registered: demo \(demo-abc123\), other \(other-1\)/)
 })
